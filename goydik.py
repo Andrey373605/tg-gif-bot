@@ -53,6 +53,7 @@ SLOW = "гойдик задумался и уснул прямо за столо
 TIMEOUT = 30  # seconds per request
 HEDGE_AFTER = 8  # no answer by then: ask the next model too and take whichever answers first
 BUSY_FOR = 300  # an overloaded model goes to the back of the queue for this many seconds
+DAILY_QUOTA_PAUSE = 3600  # out of free requests for today: re-check the model hourly
 THINKING_LEVEL = "low"  # the lowest level gemini-3.8-flash allows
 
 busy_until = {}  # model -> time.monotonic() when it's worth asking it first again
@@ -170,9 +171,36 @@ async def race(client, models, body, headers):
             task.cancel()
 
 
+def error_info(r):
+    """(one-line reason, seconds Google asks to wait or None) from a Gemini error response."""
+    try:
+        err = r.json().get("error") or {}
+    except ValueError:
+        return r.text[:200].replace("\n", " "), None
+    reason = (err.get("message") or "").split("\n")[0][:200]
+    wait, daily = None, False
+    for detail in err.get("details") or []:
+        kind = detail.get("@type", "")
+        if kind.endswith("RetryInfo"):
+            try:
+                wait = float(detail.get("retryDelay", "").rstrip("s"))
+            except ValueError:
+                pass
+        if kind.endswith("QuotaFailure"):
+            quotas = [v.get("quotaId", "") for v in detail.get("violations") or []]
+            reason += f" [{', '.join(quotas)}]"
+            daily = daily or any("PerDay" in q for q in quotas)
+    if daily:
+        # Daily free quota is over: no point asking this model again soon,
+        # whatever retryDelay says
+        wait = max(wait or 0, DAILY_QUOTA_PAUSE)
+    return reason, wait
+
+
 async def attempt(client, model, body, headers):
     """One model's answer; TryNext if another model may still help, GoydikError if not."""
     url = API_URL.format(model=model)
+    started = time.monotonic()
     try:
         r = await client.post(url, json=body, headers=headers)
         if r.status_code == 400 and "thinking" in r.text.lower():
@@ -189,14 +217,18 @@ async def attempt(client, model, body, headers):
         raise TryNext(BROKEN)
 
     if r.status_code in RETRY_STATUSES:
-        log.warning("gemini %s (model %s): %s", r.status_code, model, r.text[:300])
-        busy_until[model] = time.monotonic() + BUSY_FOR
+        reason, wait = error_info(r)
+        pause = max(BUSY_FOR, wait or 0)
+        busy_until[model] = time.monotonic() + pause
+        log.warning("gemini %s (model %s), asking it last for %ds: %s", r.status_code, model, pause, reason)
         raise TryNext(TIRED)
     if r.status_code == 404:
-        log.error("gemini 404, no model %s: %s", model, r.text[:300])
+        log.error("gemini 404, no model %s: %s", model, error_info(r)[0])
         raise TryNext(BROKEN)
     if r.status_code != 200:
         # 400 "User location is not supported" and the like: another model won't help
-        log.error("gemini %s (model %s): %s", r.status_code, model, r.text[:500])
+        log.error("gemini %s (model %s): %s", r.status_code, model, error_info(r)[0])
         raise GoydikError(BROKEN)
-    return parse_reply(r.json())
+    answer = parse_reply(r.json())
+    log.info("answered by %s in %.1fs", model, time.monotonic() - started)
+    return answer
