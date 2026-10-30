@@ -16,10 +16,11 @@ import os
 import tempfile
 from pathlib import Path
 
-from telegram import Update
+from telegram import MessageEntity, Update
 from telegram.constants import ChatAction
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
+from links import LinkError, download
 from tg_gif import convert
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
@@ -30,9 +31,11 @@ MAX_DOWNLOAD = 20 * 1024 * 1024  # Bot API can't download larger files
 MAX_GIF = 50 * 1024 * 1024  # Bot API upload limit
 
 HELP = (
-    "Кинь мне картинку, GIF, видео или стикер, а я верну гифку, "
+    "Кинь мне картинку, GIF, видео, стикер или ссылку на них, а я верну гифку, "
     "которую можно сохранить в «Мои GIF».\n\n"
-    "Картинку можно отправить и сжатой, и файлом."
+    "Картинку можно отправить и сжатой, и файлом. Ссылки подходят с Pinterest, "
+    "TikTok, X, Reddit и других сайтов, а также прямые ссылки на файлы. "
+    "Из видео беру первые 20 секунд."
 )
 
 
@@ -78,32 +81,71 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         src = tmp / f"gif_{name}{suffix}"
         tg_file = await context.bot.get_file(media.file_id)
         await tg_file.download_to_drive(src)
+        await convert_and_reply(msg, src, tmp)
 
+
+async def convert_and_reply(msg, src, tmp):
+    try:
+        dst = await asyncio.to_thread(convert, src, tmp, 2, 480, 10)
+    except Exception:
+        log.exception("conversion failed")
+        await msg.reply_text("Не получилось сконвертировать этот файл 😿")
+        return
+
+    if dst.stat().st_size > MAX_GIF:
+        await msg.reply_text("Гифка вышла больше 50 МБ, попробуй файл покороче или поменьше.")
+        return
+    with dst.open("rb") as f:
+        await msg.reply_animation(f, filename=dst.name)
+
+
+def find_url(msg):
+    for ent in msg.entities or []:
+        if ent.type == MessageEntity.TEXT_LINK:
+            return ent.url
+        if ent.type == MessageEntity.URL:
+            return msg.parse_entity(ent)
+    return None
+
+
+async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    url = find_url(msg)
+    if not url:
+        await start(update, context)
+        return
+    if "://" not in url:
+        url = "https://" + url
+
+    await context.bot.send_chat_action(msg.chat_id, ChatAction.UPLOAD_DOCUMENT)
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
         try:
-            dst = await asyncio.to_thread(convert, src, tmp, 2, 480, 10)
+            src = await asyncio.to_thread(download, url, tmp)
+        except LinkError as e:
+            await msg.reply_text(str(e))
+            return
         except Exception:
-            log.exception("conversion failed")
-            await msg.reply_text("Не получилось сконвертировать этот файл 😿")
+            log.exception("link download failed: %s", url)
+            await msg.reply_text("Не получилось скачать по этой ссылке 😿")
             return
-
-        if dst.stat().st_size > MAX_GIF:
-            await msg.reply_text("Гифка вышла больше 50 МБ, попробуй файл покороче или поменьше.")
-            return
-        with dst.open("rb") as f:
-            await msg.reply_animation(f, filename=dst.name)
+        name = hashlib.md5(url.encode()).hexdigest()[:8]
+        src = src.rename(tmp / f"gif_{name}{src.suffix}")
+        await convert_and_reply(msg, src, tmp)
 
 
 def main():
     token = os.environ["BOT_TOKEN"]
     # Python 3.14 no longer creates a loop implicitly, PTB expects one
     asyncio.set_event_loop(asyncio.new_event_loop())
-    app =Application.builder().token(token).build()
+    app = Application.builder().token(token).build()
     app.add_handler(CommandHandler(["start", "help"], start))
     media = (
         filters.PHOTO | filters.ANIMATION | filters.VIDEO | filters.VIDEO_NOTE
         | filters.Sticker.ALL | filters.Document.ALL
     )
     app.add_handler(MessageHandler(media, handle_media))
+    app.add_handler(MessageHandler(filters.Entity("url") | filters.Entity("text_link"), handle_link))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, start))
 
     webhook_url = os.environ.get("WEBHOOK_URL") or os.environ.get("RENDER_EXTERNAL_URL")

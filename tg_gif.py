@@ -19,6 +19,7 @@ import imageio_ffmpeg
 from PIL import Image, ImageSequence
 
 FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
+MAX_VIDEO_SECONDS = 20  # longer GIFs get huge, keep only the beginning
 
 
 def open_image(path):
@@ -75,7 +76,11 @@ def video_to_gif(src, dst, max_side, fps):
         f"fps={fps},scale='min({max_side},iw)':'min({max_side},ih)':force_original_aspect_ratio=decrease:flags=lanczos,"
         "split[a][b];[a]palettegen[p];[b][p]paletteuse"
     )
-    subprocess.run([FFMPEG, "-y", "-loglevel", "error", "-i", str(src), "-vf", vf, "-loop", "0", str(dst)], check=True)
+    subprocess.run(
+        [FFMPEG, "-y", "-loglevel", "error", "-i", str(src), "-t", str(MAX_VIDEO_SECONDS),
+         "-vf", vf, "-loop", "0", str(dst)],
+        check=True,
+    )
 
 
 def convert(src, out_dir, duration, max_side, fps):
