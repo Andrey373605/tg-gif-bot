@@ -8,15 +8,18 @@ Env:
                     (on Render it's taken from RENDER_EXTERNAL_URL automatically);
                     if empty, the bot runs in polling mode (for local runs)
     PORT            port for webhook mode (Render sets it)
+    ADMIN_CHAT_ID   chat id that receives /inc reports (send /id to the bot to learn yours)
 """
 import asyncio
 import hashlib
 import logging
 import os
+import secrets
 import tempfile
+import time
 from pathlib import Path
 
-from telegram import MessageEntity, Update
+from telegram import BotCommand, MessageEntity, Update
 from telegram.constants import ChatAction
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
@@ -29,18 +32,85 @@ log = logging.getLogger("bot")
 
 MAX_DOWNLOAD = 20 * 1024 * 1024  # Bot API can't download larger files
 MAX_GIF = 50 * 1024 * 1024  # Bot API upload limit
+INC_COOLDOWN = 60  # seconds between reports from one user, so nobody can flood the admin
 
 HELP = (
     "Кинь мне картинку, GIF, видео, стикер или ссылку на них, а я верну гифку, "
     "которую можно сохранить в «Мои GIF».\n\n"
     "Картинку можно отправить и сжатой, и файлом. Ссылки подходят с Pinterest, "
     "TikTok, X, Reddit и других сайтов, а также прямые ссылки на файлы. "
-    "Из видео беру первые 20 секунд."
+    "Из видео беру первые 20 секунд.\n\n"
+    "Что-то сломалось? Напиши /inc и опиши проблему, а можно ответить командой /inc "
+    "на сообщение, с которым что-то не так."
+)
+INC_USAGE = (
+    "Опиши проблему после команды, например:\n"
+    "/inc кинул ссылку на пин, бот ответил ошибкой\n\n"
+    "Можно ответить командой /inc на сообщение, с которым что-то не так: я перешлю и его."
 )
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(HELP)
+
+
+async def show_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"chat id этого чата: {update.effective_chat.id}")
+
+
+def describe_user(user):
+    if user is None:
+        return "неизвестно"
+    parts = [user.full_name]
+    if user.username:
+        parts.append(f"@{user.username}")
+    parts.append(f"id {user.id}")
+    return ", ".join(parts)
+
+
+async def report_incident(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    text = " ".join(context.args).strip()
+    replied = msg.reply_to_message
+    if not text and not replied:
+        await msg.reply_text(INC_USAGE)
+        return
+
+    admin_chat = os.environ.get("ADMIN_CHAT_ID")
+    if not admin_chat:
+        log.warning("/inc used but ADMIN_CHAT_ID is not set")
+        await msg.reply_text("Сейчас сообщить о проблеме нельзя: бот ещё не настроен 😿")
+        return
+
+    user = msg.from_user
+    last = context.bot_data.setdefault("inc_last", {})
+    now = time.monotonic()
+    if user and now - last.get(user.id, -INC_COOLDOWN) < INC_COOLDOWN:
+        await msg.reply_text("Ты только что отправил инцидент, подожди минуту.")
+        return
+
+    inc_id = secrets.token_hex(3)
+    report = (
+        f"🚨 Инцидент #{inc_id}\n"
+        f"От: {describe_user(user)}\n"
+        f"Чат: {msg.chat_id}\n"
+        f"Время: {msg.date:%Y-%m-%d %H:%M} UTC\n\n"
+        f"{text or '(без описания, см. пересланное сообщение)'}"
+    )
+    try:
+        # Plain text, no parse_mode: user text can't break formatting
+        await context.bot.send_message(admin_chat, report)
+        if replied:
+            await context.bot.forward_message(admin_chat, msg.chat_id, replied.message_id)
+    except Exception:
+        log.exception("failed to deliver incident %s", inc_id)
+        await msg.reply_text("Не получилось отправить инцидент, попробуй позже 😿")
+        return
+
+    if user:
+        last[user.id] = now
+    log.info("incident #%s from %s", inc_id, describe_user(user))
+    await msg.reply_text(f"Спасибо! Инцидент #{inc_id} отправлен, разберусь.")
 
 
 def pick_file(msg):
@@ -134,12 +204,22 @@ async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await convert_and_reply(msg, src, tmp)
 
 
+async def set_commands(app):
+    # The menu next to the input field in Telegram
+    await app.bot.set_my_commands([
+        BotCommand("help", "Что умеет бот"),
+        BotCommand("inc", "Сообщить о проблеме"),
+    ])
+
+
 def main():
     token = os.environ["BOT_TOKEN"]
     # Python 3.14 no longer creates a loop implicitly, PTB expects one
     asyncio.set_event_loop(asyncio.new_event_loop())
-    app = Application.builder().token(token).build()
+    app = Application.builder().token(token).post_init(set_commands).build()
     app.add_handler(CommandHandler(["start", "help"], start))
+    app.add_handler(CommandHandler("inc", report_incident))
+    app.add_handler(CommandHandler("id", show_id))
     media = (
         filters.PHOTO | filters.ANIMATION | filters.VIDEO | filters.VIDEO_NOTE
         | filters.Sticker.ALL | filters.Document.ALL
