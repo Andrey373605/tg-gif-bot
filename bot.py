@@ -47,7 +47,8 @@ HELP = (
     "Reddit и другие сайты, прямые ссылки на файлы), а я верну гифку, которую можно "
     "сохранить в «Мои GIF». Из видео беру первые 20 секунд.\n\n"
     "🍺 Гойдик. Просто напиши мне что-нибудь, и ответит Гойдик, твой вечно бухой кореш.\n\n"
-    "В групповых чатах отметь меня (@image_to_giff_bot вопрос), и ответит Гойдик. "
+    # {username} is filled from Telegram, so the text follows the bot whatever it's called
+    "В групповых чатах отметь меня (@{username} вопрос), и ответит Гойдик. "
     "Если отметить меня в ответ на чьё-то сообщение, Гойдик его прокомментирует.\n"
     "Остальное в группах — командами:\n"
     "/gif — ответь этой командой на картинку, видео или ссылку, или напиши /gif ссылка\n"
@@ -68,7 +69,7 @@ INC_USAGE = (
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(HELP)
+    await update.message.reply_text(HELP.format(username=context.bot.username))
 
 
 async def show_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -317,7 +318,7 @@ def mentions_bot(msg, username):
 
 
 def strip_mention(text, username):
-    """'слышь @image_to_giff_bot пиво будешь' -> 'слышь пиво будешь'."""
+    """'слышь @goydik_bot пиво будешь' -> 'слышь пиво будешь'."""
     text = re.sub(rf"@{re.escape(username)}\b", "", text or "", flags=re.I)
     return re.sub(r"[ \t]{2,}", " ", text).strip()
 
@@ -332,7 +333,7 @@ async def goydik_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def group_mention(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """In groups Гойдик answers when the bot is tagged: '@image_to_giff_bot как дела'."""
+    """In groups Гойдик answers when the bot is tagged: '@goydik_bot как дела'."""
     msg = update.message
     username = context.bot.username
     if not mentions_bot(msg, username):
