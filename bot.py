@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
-"""Telegram bot: send it a picture / GIF / video / sticker, get back a GIF
-that can be saved to "My GIFs".
+"""Telegram bot: send it a picture / GIF / video / sticker / link, get back a GIF
+that can be saved to "My GIFs". Plain text goes to Гойдик (Gemini).
+
+In private chats everything works without commands. In groups the bot only
+reacts to commands: /gif, /goydik, /inc, /help, /id.
 
 Env:
     BOT_TOKEN       token from @BotFather (required)
@@ -9,6 +12,7 @@ Env:
                     if empty, the bot runs in polling mode (for local runs)
     PORT            port for webhook mode (Render sets it)
     ADMIN_CHAT_ID   chat or channel id that receives /inc reports (send /id there to learn it)
+    GEMINI_API_KEY  enables Гойдик, see goydik.py
 """
 import asyncio
 import hashlib
@@ -23,6 +27,7 @@ from telegram import BotCommand, MessageEntity, Update
 from telegram.constants import ChatAction
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
+import goydik
 from links import LinkError, download
 from tg_gif import convert
 
@@ -35,14 +40,22 @@ MAX_GIF = 50 * 1024 * 1024  # Bot API upload limit
 INC_COOLDOWN = 60  # seconds between reports from one user, so nobody can flood the admin
 
 HELP = (
-    "Кинь мне картинку, GIF, видео, стикер или ссылку на них, а я верну гифку, "
-    "которую можно сохранить в «Мои GIF».\n\n"
-    "Картинку можно отправить и сжатой, и файлом. Ссылки подходят с Pinterest, "
-    "TikTok, X, Reddit и других сайтов, а также прямые ссылки на файлы. "
-    "Из видео беру первые 20 секунд.\n\n"
-    "Что-то сломалось? Напиши /inc и опиши проблему, а можно ответить командой /inc "
-    "на сообщение, с которым что-то не так."
+    "Я умею две вещи.\n\n"
+    "🎞 Гифки. Кинь картинку, GIF, видео, стикер или ссылку на них (Pinterest, TikTok, X, "
+    "Reddit и другие сайты, прямые ссылки на файлы), а я верну гифку, которую можно "
+    "сохранить в «Мои GIF». Из видео беру первые 20 секунд.\n\n"
+    "🍺 Гойдик. Просто напиши мне что-нибудь, и ответит Гойдик, твой вечно бухой кореш.\n\n"
+    "В групповых чатах я реагирую только на команды:\n"
+    "/gif — ответь этой командой на картинку, видео или ссылку, или напиши /gif ссылка\n"
+    "/goydik вопрос — спросить Гойдика (или ответь /goydik на сообщение)\n"
+    "/inc описание — сообщить о проблеме с ботом"
 )
+GIF_USAGE = (
+    "Ответь командой /gif на сообщение с картинкой, видео, стикером или ссылкой, "
+    "или напиши /gif ссылка"
+)
+GOYDIK_USAGE = "спроси чё-нибудь, бро: /goydik как дела\nили ответь /goydik на сообщение 🍺"
+GOYDIK_ASLEEP = "Гойдик сейчас спит 😴 (не настроен ключ Gemini)"
 INC_USAGE = (
     "Опиши проблему после команды, например:\n"
     "/inc кинул ссылку на пин, бот ответил ошибкой\n\n"
@@ -57,6 +70,184 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def show_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # effective_message: in a channel the command arrives as channel_post, not message
     await update.effective_message.reply_text(f"chat id этого чата: {update.effective_chat.id}")
+
+
+# --- GIFs -----------------------------------------------------------------------------
+
+
+def pick_file(msg):
+    """Return (file object with file_id/file_size, suffix) for the media in msg."""
+    if msg.photo:
+        return msg.photo[-1], ".jpg"
+    if msg.animation:
+        return msg.animation, ".mp4"
+    if msg.video:
+        return msg.video, ".mp4"
+    if msg.video_note:
+        return msg.video_note, ".mp4"
+    if msg.sticker:
+        if msg.sticker.is_animated:
+            return None, None  # .tgs (Lottie) isn't supported
+        return msg.sticker, ".webm" if msg.sticker.is_video else ".webp"
+    if msg.document:
+        name = msg.document.file_name or "file"
+        return msg.document, Path(name).suffix or ".bin"
+    return None, None
+
+
+def find_url(msg):
+    for ent, text in list(msg.parse_entities().items()) + list(msg.parse_caption_entities().items()):
+        if ent.type == MessageEntity.TEXT_LINK:
+            return ent.url
+        if ent.type == MessageEntity.URL:
+            return text
+    return None
+
+
+async def convert_and_reply(msg, src, tmp):
+    try:
+        dst = await asyncio.to_thread(convert, src, tmp, 2, 480, 10)
+    except Exception:
+        log.exception("conversion failed")
+        await msg.reply_text("Не получилось сконвертировать этот файл 😿")
+        return
+
+    if dst.stat().st_size > MAX_GIF:
+        await msg.reply_text("Гифка вышла больше 50 МБ, попробуй файл покороче или поменьше.")
+        return
+    with dst.open("rb") as f:
+        await msg.reply_animation(f, filename=dst.name)
+
+
+async def gif_from_media(msg, media, suffix, context):
+    """Convert `media` and reply to `msg` (they may be different messages, e.g. /gif as a reply)."""
+    if media.file_size and media.file_size > MAX_DOWNLOAD:
+        await msg.reply_text("Файл больше 20 МБ: боты не могут скачивать такие файлы.")
+        return
+
+    await context.bot.send_chat_action(msg.chat_id, ChatAction.UPLOAD_DOCUMENT)
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        # Name the GIF by content so Telegram shows a sensible file name
+        name = hashlib.md5(media.file_unique_id.encode()).hexdigest()[:8]
+        src = tmp / f"gif_{name}{suffix}"
+        tg_file = await context.bot.get_file(media.file_id)
+        await tg_file.download_to_drive(src)
+        await convert_and_reply(msg, src, tmp)
+
+
+async def gif_from_url(msg, url, context):
+    if "://" not in url:
+        url = "https://" + url
+
+    await context.bot.send_chat_action(msg.chat_id, ChatAction.UPLOAD_DOCUMENT)
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        try:
+            src = await asyncio.to_thread(download, url, tmp)
+        except LinkError as e:
+            await msg.reply_text(str(e))
+            return
+        except Exception:
+            log.exception("link download failed: %s", url)
+            await msg.reply_text("Не получилось скачать по этой ссылке 😿")
+            return
+        name = hashlib.md5(url.encode()).hexdigest()[:8]
+        src = src.rename(tmp / f"gif_{name}{src.suffix}")
+        await convert_and_reply(msg, src, tmp)
+
+
+async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    media, suffix = pick_file(msg)
+    if media is None:
+        await msg.reply_text("Этот формат не поддерживается (анимированные стикеры .tgs пока не умею).")
+        return
+    await gif_from_media(msg, media, suffix, context)
+
+
+async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    url = find_url(msg)
+    if not url:
+        await start(update, context)
+        return
+    await gif_from_url(msg, url, context)
+
+
+async def gif_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    url = find_url(msg)  # /gif <link>
+    if url:
+        await gif_from_url(msg, url, context)
+        return
+
+    src = msg.reply_to_message
+    if src:
+        media, suffix = pick_file(src)
+        if media:
+            await gif_from_media(msg, media, suffix, context)
+            return
+        url = find_url(src)
+        if url:
+            await gif_from_url(msg, url, context)
+            return
+        if src.sticker:
+            await msg.reply_text("Анимированные стикеры .tgs пока не умею 😿")
+            return
+    await msg.reply_text(GIF_USAGE)
+
+
+# --- Гойдик ---------------------------------------------------------------------------
+
+
+def command_text(msg):
+    """Text after the command: '/goydik@bot как дела' -> 'как дела' (keeps line breaks)."""
+    parts = (msg.text or "").split(None, 1)
+    return parts[1].strip() if len(parts) > 1 else ""
+
+
+async def talk(msg, text, context):
+    if not goydik.enabled():
+        await msg.reply_text(GOYDIK_ASLEEP)
+        return
+    history = context.chat_data.setdefault("goydik_history", [])
+    author = msg.from_user.first_name if msg.from_user else "кто-то"
+    await context.bot.send_chat_action(msg.chat_id, ChatAction.TYPING)
+    try:
+        answer = await goydik.ask(history, author, text)
+    except goydik.GoydikError as e:
+        answer = str(e)
+    except Exception:
+        log.exception("goydik failed")
+        answer = goydik.BROKEN
+    await msg.reply_text(answer)
+
+
+async def goydik_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    text = command_text(msg)
+    replied = msg.reply_to_message
+    if not text and replied:
+        quoted = replied.text or replied.caption
+        if quoted:
+            who = replied.from_user.first_name if replied.from_user else "кто-то"
+            text = f"чё скажешь про это сообщение от {who}: «{quoted}»"
+    if not text:
+        await msg.reply_text(GOYDIK_USAGE)
+        return
+    await talk(msg, text, context)
+
+
+async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not goydik.enabled():
+        await start(update, context)
+        return
+    await talk(msg, msg.text, context)
+
+
+# --- Incidents ------------------------------------------------------------------------
 
 
 def describe_user(user):
@@ -114,120 +305,42 @@ async def report_incident(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.reply_text(f"Спасибо! Инцидент #{inc_id} отправлен, разберусь.")
 
 
-def pick_file(msg):
-    """Return (file object with file_id/file_size, suffix) for the incoming media."""
-    if msg.photo:
-        return msg.photo[-1], ".jpg"
-    if msg.animation:
-        return msg.animation, ".mp4"
-    if msg.video:
-        return msg.video, ".mp4"
-    if msg.video_note:
-        return msg.video_note, ".mp4"
-    if msg.sticker:
-        if msg.sticker.is_animated:
-            return None, None  # .tgs (Lottie) isn't supported
-        return msg.sticker, ".webm" if msg.sticker.is_video else ".webp"
-    if msg.document:
-        name = msg.document.file_name or "file"
-        return msg.document, Path(name).suffix or ".bin"
-    return None, None
-
-
-async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    media, suffix = pick_file(msg)
-    if media is None:
-        await msg.reply_text("Этот формат не поддерживается (анимированные стикеры .tgs пока не умею).")
-        return
-    if media.file_size and media.file_size > MAX_DOWNLOAD:
-        await msg.reply_text("Файл больше 20 МБ: боты не могут скачивать такие файлы.")
-        return
-
-    await context.bot.send_chat_action(msg.chat_id, ChatAction.UPLOAD_DOCUMENT)
-    with tempfile.TemporaryDirectory() as tmp:
-        tmp = Path(tmp)
-        # Name the GIF by content so Telegram shows a sensible file name
-        name = hashlib.md5(media.file_unique_id.encode()).hexdigest()[:8]
-        src = tmp / f"gif_{name}{suffix}"
-        tg_file = await context.bot.get_file(media.file_id)
-        await tg_file.download_to_drive(src)
-        await convert_and_reply(msg, src, tmp)
-
-
-async def convert_and_reply(msg, src, tmp):
-    try:
-        dst = await asyncio.to_thread(convert, src, tmp, 2, 480, 10)
-    except Exception:
-        log.exception("conversion failed")
-        await msg.reply_text("Не получилось сконвертировать этот файл 😿")
-        return
-
-    if dst.stat().st_size > MAX_GIF:
-        await msg.reply_text("Гифка вышла больше 50 МБ, попробуй файл покороче или поменьше.")
-        return
-    with dst.open("rb") as f:
-        await msg.reply_animation(f, filename=dst.name)
-
-
-def find_url(msg):
-    for ent in msg.entities or []:
-        if ent.type == MessageEntity.TEXT_LINK:
-            return ent.url
-        if ent.type == MessageEntity.URL:
-            return msg.parse_entity(ent)
-    return None
-
-
-async def handle_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message
-    url = find_url(msg)
-    if not url:
-        await start(update, context)
-        return
-    if "://" not in url:
-        url = "https://" + url
-
-    await context.bot.send_chat_action(msg.chat_id, ChatAction.UPLOAD_DOCUMENT)
-    with tempfile.TemporaryDirectory() as tmp:
-        tmp = Path(tmp)
-        try:
-            src = await asyncio.to_thread(download, url, tmp)
-        except LinkError as e:
-            await msg.reply_text(str(e))
-            return
-        except Exception:
-            log.exception("link download failed: %s", url)
-            await msg.reply_text("Не получилось скачать по этой ссылке 😿")
-            return
-        name = hashlib.md5(url.encode()).hexdigest()[:8]
-        src = src.rename(tmp / f"gif_{name}{src.suffix}")
-        await convert_and_reply(msg, src, tmp)
+# --- Setup ----------------------------------------------------------------------------
 
 
 async def set_commands(app):
     # The menu next to the input field in Telegram
     await app.bot.set_my_commands([
-        BotCommand("help", "Что умеет бот"),
+        BotCommand("gif", "Сделать гифку из картинки, видео или ссылки"),
+        BotCommand("goydik", "Спросить Гойдика"),
         BotCommand("inc", "Сообщить о проблеме"),
+        BotCommand("help", "Что умеет бот"),
     ])
 
 
 def build_app(token):
-    app = Application.builder().token(token).post_init(set_commands).build()
-    # Only new messages in chats with the bot. Without this the bot would also answer
-    # posts in the incidents channel and crash on edited messages (update.message is None there)
+    # A few updates at once, so one long video doesn't block everyone else.
+    # Not more: parallel ffmpeg runs would eat the free instance's memory
+    app = Application.builder().token(token).post_init(set_commands).concurrent_updates(4).build()
+    # Only new messages. Without this the bot would also answer posts in the incidents
+    # channel and crash on edited messages (update.message is None there)
     new_msg = filters.UpdateType.MESSAGE
+    # Groups only get commands; everything without a command works in private chats
+    private = new_msg & filters.ChatType.PRIVATE
+
     app.add_handler(CommandHandler(["start", "help"], start, filters=new_msg))
+    app.add_handler(CommandHandler("gif", gif_command, filters=new_msg))
+    app.add_handler(CommandHandler(["goydik", "g"], goydik_command, filters=new_msg))
     app.add_handler(CommandHandler("inc", report_incident, filters=new_msg))
     app.add_handler(CommandHandler("id", show_id, filters=new_msg | filters.UpdateType.CHANNEL_POST))
     media = (
         filters.PHOTO | filters.ANIMATION | filters.VIDEO | filters.VIDEO_NOTE
         | filters.Sticker.ALL | filters.Document.ALL
     )
-    app.add_handler(MessageHandler(new_msg & media, handle_media))
-    app.add_handler(MessageHandler(new_msg & (filters.Entity("url") | filters.Entity("text_link")), handle_link))
-    app.add_handler(MessageHandler(new_msg & ~filters.COMMAND, start))
+    app.add_handler(MessageHandler(private & media, handle_media))
+    app.add_handler(MessageHandler(private & (filters.Entity("url") | filters.Entity("text_link")), handle_link))
+    app.add_handler(MessageHandler(private & filters.TEXT & ~filters.COMMAND, private_text))
+    app.add_handler(MessageHandler(private & ~filters.COMMAND, start))
     return app
 
 

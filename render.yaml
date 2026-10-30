@@ -10,3 +10,7 @@ services:
         sync: false
       - key: PYTHON_VERSION
         value: "3.12.7"
+      - key: ADMIN_CHAT_ID
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
