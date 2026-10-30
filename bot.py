@@ -234,6 +234,13 @@ def remember(chat_data, message_id, who, text):
     recent.append({"id": message_id, "who": who, "text": text[:RECENT_MAX_CHARS]})
 
 
+def forget(chat_data, message_id):
+    recent = chat_data.get("recent")
+    if recent:
+        for entry in [e for e in recent if e["id"] == message_id]:
+            recent.remove(entry)
+
+
 def describe_message(msg, username):
     """One line of text for the context log: text, caption and a mark for media."""
     parts = [mark for attr, mark in MEDIA_MARKS if getattr(msg, attr)]
@@ -290,7 +297,10 @@ async def talk(msg, text, context):
         log.exception("goydik failed")
         answer = goydik.BROKEN
     if answer is None:
-        return  # a "reply and you're a loser" trap: Гойдик doesn't take the bait
+        # A "reply and you're a loser" trap: Гойдик doesn't take the bait. Drop it from the
+        # group log too, or Gemini keeps seeing it and stays silent on every next message
+        forget(context.chat_data, msg.message_id)
+        return
     sent = await msg.reply_text(answer)
     if ok and in_group and sent:
         # The bot doesn't receive its own messages, so add the answer to the log by hand
