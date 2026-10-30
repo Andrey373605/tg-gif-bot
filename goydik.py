@@ -6,9 +6,11 @@ Env:
     GEMINI_FALLBACK_MODEL   asked when the main model is overloaded or out of quota,
                             default gemini-3.5-flash-lite; empty value turns it off
 """
+import asyncio
 import copy
 import logging
 import os
+import time
 
 import httpx
 
@@ -94,12 +96,24 @@ TIRED = "гойдик перебрал, дай ему минутку отдыш�
 BROKEN = "гойдик упал под стол, попробуй чуть позже 😵"
 SLOW = "гойдик задумался и уснул прямо за столом 😴 спроси ещё раз"
 
-TIMEOUT = 30  # seconds per model; with a fallback the worst case is a minute
+TIMEOUT = 30  # seconds per request
+HEDGE_AFTER = 8  # no answer by then: ask the next model too and take whichever answers first
+BUSY_FOR = 300  # an overloaded model goes to the back of the queue for this many seconds
 THINKING_LEVEL = "low"  # the lowest level gemini-3.8-flash allows
+
+busy_until = {}  # model -> time.monotonic() when it's worth asking it first again
 
 
 class GoydikError(Exception):
     """Text for the user about why Гойдик didn't answer."""
+
+
+class TryNext(Exception):
+    """This model can't answer right now, another one may."""
+
+    def __init__(self, user_text):
+        super().__init__(user_text)
+        self.user_text = user_text
 
 
 def enabled():
@@ -150,49 +164,85 @@ async def ask(history, author, text, recent=None, transport=None):
         "safetySettings": [{"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_ONLY_HIGH"}],
     }
     headers = {"x-goog-api-key": os.environ["GEMINI_API_KEY"]}
+
+    async with httpx.AsyncClient(timeout=TIMEOUT, transport=transport) as client:
+        answer = await race(client, model_queue(), body, headers)
+    history.append(user_turn)
+    history.append({"role": "model", "parts": [{"text": answer}]})
+    del history[:-HISTORY_LIMIT]
+    return answer
+
+
+def model_queue():
+    """Main model, then fallback; models that were overloaded recently go last."""
     models = [os.environ.get("GEMINI_MODEL") or DEFAULT_MODEL]
     fallback = os.environ.get("GEMINI_FALLBACK_MODEL", DEFAULT_FALLBACK)
     if fallback and fallback not in models:
         models.append(fallback)
+    now = time.monotonic()
+    return sorted(models, key=lambda m: busy_until.get(m, 0) > now)  # stable: order kept otherwise
 
+
+async def race(client, models, body, headers):
+    """Ask models[0]; if it fails, or is silent for HEDGE_AFTER seconds, ask the next one too.
+    The first proper answer wins, the rest are cancelled."""
+    queue = list(models)
+    running = set()
     error = BROKEN
-    async with httpx.AsyncClient(timeout=TIMEOUT, transport=transport) as client:
-        for model in models:
-            try:
-                r = await post(client, model, copy.deepcopy(body), headers)
-            except httpx.TimeoutException:
-                log.warning("gemini (model %s) didn't answer in %ss", model, TIMEOUT)
-                error = SLOW
+
+    def start_next():
+        model = queue.pop(0)
+        running.add(asyncio.create_task(attempt(client, model, copy.deepcopy(body), headers)))
+
+    start_next()
+    try:
+        while running:
+            wait = HEDGE_AFTER if queue else None
+            done, _ = await asyncio.wait(running, timeout=wait, return_when=asyncio.FIRST_COMPLETED)
+            if not done:
+                start_next()  # current model is taking too long, don't just wait for it
                 continue
-            except httpx.TransportError as e:
-                log.warning("gemini (model %s) connection failed: %r", model, e)
-                error = BROKEN
-                continue
-
-            if r.status_code in RETRY_STATUSES or r.status_code == 404:
-                # 404: wrong model name; the next model may still work
-                log.warning("gemini %s (model %s): %s", r.status_code, model, r.text[:300])
-                error = BROKEN if r.status_code == 404 else TIRED
-                continue
-            if r.status_code != 200:
-                # 400 "User location is not supported" and the like: another model won't help
-                log.error("gemini %s (model %s): %s", r.status_code, model, r.text[:500])
-                raise GoydikError(BROKEN)
-
-            answer = parse_reply(r.json())
-            history.append(user_turn)
-            history.append({"role": "model", "parts": [{"text": answer}]})
-            del history[:-HISTORY_LIMIT]
-            return answer
-    raise GoydikError(error)
+            for task in done:
+                running.discard(task)
+                try:
+                    return task.result()
+                except TryNext as e:
+                    error = e.user_text
+                    if queue and not running:
+                        start_next()
+        raise GoydikError(error)
+    finally:
+        for task in running:
+            task.cancel()
 
 
-async def post(client, model, body, headers):
+async def attempt(client, model, body, headers):
+    """One model's answer; TryNext if another model may still help, GoydikError if not."""
     url = API_URL.format(model=model)
-    r = await client.post(url, json=body, headers=headers)
-    if r.status_code == 400 and "thinking" in r.text.lower():
-        # This model doesn't know the level: ask with its defaults
-        log.warning("model %s rejected thinkingLevel=%s, retrying without it", model, THINKING_LEVEL)
-        del body["generationConfig"]["thinkingConfig"]
+    try:
         r = await client.post(url, json=body, headers=headers)
-    return r
+        if r.status_code == 400 and "thinking" in r.text.lower():
+            # This model doesn't know the level: ask with its defaults
+            log.warning("model %s rejected thinkingLevel=%s, retrying without it", model, THINKING_LEVEL)
+            del body["generationConfig"]["thinkingConfig"]
+            r = await client.post(url, json=body, headers=headers)
+    except httpx.TimeoutException:
+        log.warning("gemini (model %s) didn't answer in %ss", model, TIMEOUT)
+        busy_until[model] = time.monotonic() + BUSY_FOR
+        raise TryNext(SLOW)
+    except httpx.TransportError as e:
+        log.warning("gemini (model %s) connection failed: %r", model, e)
+        raise TryNext(BROKEN)
+
+    if r.status_code in RETRY_STATUSES:
+        log.warning("gemini %s (model %s): %s", r.status_code, model, r.text[:300])
+        busy_until[model] = time.monotonic() + BUSY_FOR
+        raise TryNext(TIRED)
+    if r.status_code == 404:
+        log.error("gemini 404, no model %s: %s", model, r.text[:300])
+        raise TryNext(BROKEN)
+    if r.status_code != 200:
+        # 400 "User location is not supported" and the like: another model won't help
+        log.error("gemini %s (model %s): %s", r.status_code, model, r.text[:500])
+        raise GoydikError(BROKEN)
+    return parse_reply(r.json())

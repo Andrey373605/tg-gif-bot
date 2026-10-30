@@ -49,7 +49,8 @@ HELP = (
     "🍺 Гойдик. Просто напиши мне что-нибудь, и ответит Гойдик, твой вечно бухой кореш.\n\n"
     # {username} is filled from Telegram, so the text follows the bot whatever it's called
     "В групповых чатах отметь меня (@{username} вопрос), и ответит Гойдик. "
-    "Если отметить меня в ответ на чьё-то сообщение, Гойдик его прокомментирует.\n"
+    "Если отметить меня в ответ на чьё-то сообщение, Гойдик его прокомментирует. "
+    "А чтобы продолжить разговор, просто ответь на сообщение Гойдика.\n"
     "Остальное в группах — командами:\n"
     "/gif — ответь этой командой на картинку, видео или ссылку, или напиши /gif ссылка\n"
     "/goydik вопрос — тоже спросить Гойдика\n"
@@ -332,14 +333,26 @@ async def goydik_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await talk(msg, text, context)
 
 
-async def group_mention(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """In groups Гойдик answers when the bot is tagged: '@goydik_bot как дела'."""
+def replies_to_goydik(msg, username):
+    """A reply to one of Гойдик's text answers (replies to the bot's GIFs don't count)."""
+    replied = msg.reply_to_message
+    return bool(
+        replied and replied.from_user and replied.from_user.username == username
+        and replied.text and not replied.animation
+    )
+
+
+async def group_goydik(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """In groups Гойдик answers when the bot is tagged ('@goydik_bot как дела')
+    or when someone replies to his message."""
     msg = update.message
     username = context.bot.username
-    if not mentions_bot(msg, username):
-        return  # someone else was tagged
+    if not (mentions_bot(msg, username) or replies_to_goydik(msg, username)):
+        return  # someone else was tagged or answered
     text = strip_mention(msg.text or msg.caption, username)
     text = with_reply(text, msg.reply_to_message, username)
+    # A reply with just a sticker or photo: tell Гойдик what it was
+    text = text or describe_message(msg, username)
     # Just "@bot" with nothing else: Гойдик reacts to being called
     await talk(msg, text or CALLED_EMPTY, context)
 
@@ -447,7 +460,9 @@ def build_app(token):
         filters.PHOTO | filters.ANIMATION | filters.VIDEO | filters.VIDEO_NOTE
         | filters.Sticker.ALL | filters.Document.ALL
     )
-    app.add_handler(MessageHandler(groups & mention & ~filters.COMMAND, group_mention))
+    # One handler for tags and replies: both may come in one message, and only the first
+    # matching handler of a group runs
+    app.add_handler(MessageHandler(groups & (mention | filters.REPLY) & ~filters.COMMAND, group_goydik))
     app.add_handler(MessageHandler(private & media, handle_media))
     app.add_handler(MessageHandler(private & (filters.Entity("url") | filters.Entity("text_link")), handle_link))
     app.add_handler(MessageHandler(private & filters.TEXT & ~filters.COMMAND, private_text))
