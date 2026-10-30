@@ -18,6 +18,7 @@ import asyncio
 import hashlib
 import logging
 import os
+import re
 import secrets
 import tempfile
 import time
@@ -45,9 +46,11 @@ HELP = (
     "Reddit и другие сайты, прямые ссылки на файлы), а я верну гифку, которую можно "
     "сохранить в «Мои GIF». Из видео беру первые 20 секунд.\n\n"
     "🍺 Гойдик. Просто напиши мне что-нибудь, и ответит Гойдик, твой вечно бухой кореш.\n\n"
-    "В групповых чатах я реагирую только на команды:\n"
+    "В групповых чатах отметь меня (@image_to_giff_bot вопрос), и ответит Гойдик. "
+    "Если отметить меня в ответ на чьё-то сообщение, Гойдик его прокомментирует.\n"
+    "Остальное в группах — командами:\n"
     "/gif — ответь этой командой на картинку, видео или ссылку, или напиши /gif ссылка\n"
-    "/goydik вопрос — спросить Гойдика (или ответь /goydik на сообщение)\n"
+    "/goydik вопрос — тоже спросить Гойдика\n"
     "/inc описание — сообщить о проблеме с ботом"
 )
 GIF_USAGE = (
@@ -224,19 +227,61 @@ async def talk(msg, text, context):
     await msg.reply_text(answer)
 
 
+CALLED_EMPTY = "(тебя просто позвали, ничего не написав)"
+
+
+def with_reply(text, replied, username):
+    """Add the message Гойдик was called on, so he knows what people are talking about."""
+    if not replied or not replied.from_user:
+        return text
+    if replied.from_user.username == username:
+        return text  # reply to Гойдик himself: it's already in the history
+    who = replied.from_user.first_name
+    quoted = replied.text or replied.caption
+    if quoted:
+        if not text:
+            return f"чё скажешь про это сообщение от {who}: «{quoted}»"
+        return f"{text}\n(это в ответ на сообщение от {who}: «{quoted}»)"
+    if replied.photo or replied.video or replied.animation or replied.sticker or replied.video_note:
+        # Гойдик only reads text
+        seen = f"{who} показывает тебе картинку или видео, но ты его не видишь, глаза не фокусируются"
+        return f"{text}\n({seen})" if text else f"({seen})"
+    return text
+
+
+def mentions_bot(msg, username):
+    me = f"@{username}".lower()
+    for ent, text in list(msg.parse_entities().items()) + list(msg.parse_caption_entities().items()):
+        if ent.type == MessageEntity.MENTION and text.lower() == me:
+            return True
+    return False
+
+
+def strip_mention(text, username):
+    """'слышь @image_to_giff_bot пиво будешь' -> 'слышь пиво будешь'."""
+    text = re.sub(rf"@{re.escape(username)}\b", "", text or "", flags=re.I)
+    return re.sub(r"[ \t]{2,}", " ", text).strip()
+
+
 async def goydik_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
-    text = command_text(msg)
-    replied = msg.reply_to_message
-    if not text and replied:
-        quoted = replied.text or replied.caption
-        if quoted:
-            who = replied.from_user.first_name if replied.from_user else "кто-то"
-            text = f"чё скажешь про это сообщение от {who}: «{quoted}»"
+    text = with_reply(command_text(msg), msg.reply_to_message, context.bot.username)
     if not text:
         await msg.reply_text(GOYDIK_USAGE)
         return
     await talk(msg, text, context)
+
+
+async def group_mention(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """In groups Гойдик answers when the bot is tagged: '@image_to_giff_bot как дела'."""
+    msg = update.message
+    username = context.bot.username
+    if not mentions_bot(msg, username):
+        return  # someone else was tagged
+    text = strip_mention(msg.text or msg.caption, username)
+    text = with_reply(text, msg.reply_to_message, username)
+    # Just "@bot" with nothing else: Гойдик reacts to being called
+    await talk(msg, text or CALLED_EMPTY, context)
 
 
 async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -244,7 +289,7 @@ async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not goydik.enabled():
         await start(update, context)
         return
-    await talk(msg, msg.text, context)
+    await talk(msg, strip_mention(msg.text, context.bot.username) or CALLED_EMPTY, context)
 
 
 # --- Incidents ------------------------------------------------------------------------
@@ -325,8 +370,10 @@ def build_app(token):
     # Only new messages. Without this the bot would also answer posts in the incidents
     # channel and crash on edited messages (update.message is None there)
     new_msg = filters.UpdateType.MESSAGE
-    # Groups only get commands; everything without a command works in private chats
+    # Groups get commands and @mentions; everything else works only in private chats
     private = new_msg & filters.ChatType.PRIVATE
+    groups = new_msg & filters.ChatType.GROUPS
+    mention = filters.Entity("mention") | filters.CaptionEntity("mention")
 
     app.add_handler(CommandHandler(["start", "help"], start, filters=new_msg))
     app.add_handler(CommandHandler("gif", gif_command, filters=new_msg))
@@ -337,6 +384,7 @@ def build_app(token):
         filters.PHOTO | filters.ANIMATION | filters.VIDEO | filters.VIDEO_NOTE
         | filters.Sticker.ALL | filters.Document.ALL
     )
+    app.add_handler(MessageHandler(groups & mention & ~filters.COMMAND, group_mention))
     app.add_handler(MessageHandler(private & media, handle_media))
     app.add_handler(MessageHandler(private & (filters.Entity("url") | filters.Entity("text_link")), handle_link))
     app.add_handler(MessageHandler(private & filters.TEXT & ~filters.COMMAND, private_text))
