@@ -22,9 +22,10 @@ import re
 import secrets
 import tempfile
 import time
+from collections import deque
 from pathlib import Path
 
-from telegram import BotCommand, MessageEntity, Update
+from telegram import BotCommand, Chat, MessageEntity, Update
 from telegram.constants import ChatAction
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
@@ -210,21 +211,79 @@ def command_text(msg):
     return parts[1].strip() if len(parts) > 1 else ""
 
 
+RECENT_LIMIT = 30  # group messages kept as context for Гойдик
+RECENT_MAX_CHARS = 500
+
+MEDIA_MARKS = [
+    ("photo", "[фото]"), ("video", "[видео]"), ("animation", "[гифка]"), ("video_note", "[кружок]"),
+    ("voice", "[голосовое]"), ("audio", "[музыка]"), ("document", "[файл]"), ("poll", "[опрос]"),
+]
+
+
+def remember(chat_data, message_id, who, text):
+    recent = chat_data.setdefault("recent", deque(maxlen=RECENT_LIMIT))
+    recent.append({"id": message_id, "who": who, "text": text[:RECENT_MAX_CHARS]})
+
+
+def describe_message(msg, username):
+    """One line of text for the context log: text, caption and a mark for media."""
+    parts = [mark for attr, mark in MEDIA_MARKS if getattr(msg, attr)]
+    if msg.sticker:
+        parts.append(f"[стикер {msg.sticker.emoji or ''}]".replace(" ]", "]"))
+    text = strip_mention(msg.text or msg.caption, username)
+    if text:
+        parts.append(text)
+    return " ".join(parts)
+
+
+async def record_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Keep the last messages of a group in memory, so Гойдик knows what's going on.
+    Needs privacy mode off in @BotFather, otherwise Telegram sends only commands and tags."""
+    msg = update.message
+    if (msg.text or "").startswith("/"):
+        return  # commands are noise for the conversation
+    line = describe_message(msg, context.bot.username)
+    if not line:
+        return  # service messages: someone joined, the title changed...
+    who = msg.from_user.first_name if msg.from_user else "кто-то"
+    replied = msg.reply_to_message
+    if replied and replied.from_user:
+        # "Вася → Лена": names can't be declined automatically, an arrow reads fine
+        target = "Гойдик" if replied.from_user.username == context.bot.username else replied.from_user.first_name
+        who = f"{who} → {target}"
+    remember(context.chat_data, msg.message_id, who, line)
+
+
+def recent_lines(chat_data, exclude_id):
+    return [f"{m['who']}: {m['text']}" for m in chat_data.get("recent", ()) if m["id"] != exclude_id]
+
+
 async def talk(msg, text, context):
     if not goydik.enabled():
         await msg.reply_text(GOYDIK_ASLEEP)
         return
-    history = context.chat_data.setdefault("goydik_history", [])
     author = msg.from_user.first_name if msg.from_user else "кто-то"
+    in_group = msg.chat.type != Chat.PRIVATE
+    if in_group:
+        # The group log already has earlier questions and Гойдик's answers
+        history, recent = [], recent_lines(context.chat_data, exclude_id=msg.message_id)
+    else:
+        history, recent = context.chat_data.setdefault("goydik_history", []), None
+
     await context.bot.send_chat_action(msg.chat_id, ChatAction.TYPING)
+    ok = False
     try:
-        answer = await goydik.ask(history, author, text)
+        answer = await goydik.ask(history, author, text, recent=recent)
+        ok = True
     except goydik.GoydikError as e:
         answer = str(e)
     except Exception:
         log.exception("goydik failed")
         answer = goydik.BROKEN
-    await msg.reply_text(answer)
+    sent = await msg.reply_text(answer)
+    if ok and in_group and sent:
+        # The bot doesn't receive its own messages, so add the answer to the log by hand
+        remember(context.chat_data, sent.message_id, "Гойдик", answer)
 
 
 CALLED_EMPTY = "(тебя просто позвали, ничего не написав)"
@@ -374,6 +433,9 @@ def build_app(token):
     private = new_msg & filters.ChatType.PRIVATE
     groups = new_msg & filters.ChatType.GROUPS
     mention = filters.Entity("mention") | filters.CaptionEntity("mention")
+
+    # Group -1 runs before the handlers below and doesn't stop them
+    app.add_handler(MessageHandler(groups, record_group_message), group=-1)
 
     app.add_handler(CommandHandler(["start", "help"], start, filters=new_msg))
     app.add_handler(CommandHandler("gif", gif_command, filters=new_msg))

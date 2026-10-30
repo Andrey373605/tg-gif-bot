@@ -25,6 +25,11 @@ PROMPT = """\
 Каждое сообщение приходит в виде «Имя: текст». Обращайся к людям по имени,
 в общем чате пишут несколько человек. Сам свой ответ именем не подписывай.
 
+В групповом чате перед сообщением тебе может быть блок «Последние сообщения в чате».
+Это то, о чём ребята болтали до того, как тебя позвали, а строки «Гойдик: ...» там —
+твои прошлые ответы. «Вася → Лена: ...» значит, что Вася ответил на сообщение Лены. Используй это, чтобы понять, о чём речь и кого имеют в виду,
+но отвечай на сообщение тебе и не пересказывай переписку.
+
 КАК ТЫ ПИШЕШЬ
 - Как в переписке с другом: маленькими буквами, без точек в конце, иногда с опечатками
   и растянутыми буквами («брооо», «дааа»).
@@ -94,10 +99,17 @@ def parse_reply(data):
     return text[:MAX_REPLY]
 
 
-async def ask(history, author, text, transport=None):
-    """Send `author: text` with the chat history; on success both sides are added to history."""
+async def ask(history, author, text, recent=None, transport=None):
+    """Send `author: text` with the chat history; on success both sides are added to history.
+    `recent`: the last lines of a group chat ("Имя: текст"), passed along as context."""
     model = os.environ.get("GEMINI_MODEL") or DEFAULT_MODEL
-    user_turn = {"role": "user", "parts": [{"text": f"{author}: {text[:MAX_INPUT]}"}]}
+    message = f"{author}: {text[:MAX_INPUT]}"
+    if recent:
+        message = (
+            "Последние сообщения в чате, для контекста:\n" + "\n".join(recent)
+            + "\n\nСообщение тебе:\n" + message
+        )
+    user_turn = {"role": "user", "parts": [{"text": message}]}
     body = {
         "system_instruction": {"parts": [{"text": PROMPT}]},
         "contents": history + [user_turn],
