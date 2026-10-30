@@ -46,7 +46,7 @@ HELP = (
     "🎞 Гифки. Кинь картинку, GIF, видео, стикер или ссылку на них (Pinterest, TikTok, X, "
     "Reddit и другие сайты, прямые ссылки на файлы), а я верну гифку, которую можно "
     "сохранить в «Мои GIF». Из видео беру первые 20 секунд.\n\n"
-    "🍺 Гойдик. Просто напиши мне что-нибудь, и ответит Гойдик, твой вечно бухой кореш.\n\n"
+    "🍺 Гойдик. Просто напиши мне что-нибудь, и ответит Гойдик, свой пацан, который всех подъёбывает.\n\n"
     # {username} is filled from Telegram, so the text follows the bot whatever it's called
     "В групповых чатах отметь меня (@{username} вопрос), и ответит Гойдик. "
     "Если отметить меня в ответ на чьё-то сообщение, Гойдик его прокомментирует. "
@@ -222,6 +222,13 @@ MEDIA_MARKS = [
 ]
 
 
+def display_name(user):
+    """'Артём Стажер (@Blaugranass)': prompt.txt finds people in its dossier by name or username."""
+    if user is None:
+        return "кто-то"
+    return f"{user.full_name} (@{user.username})" if user.username else user.full_name
+
+
 def remember(chat_data, message_id, who, text):
     recent = chat_data.setdefault("recent", deque(maxlen=RECENT_LIMIT))
     recent.append({"id": message_id, "who": who, "text": text[:RECENT_MAX_CHARS]})
@@ -247,11 +254,11 @@ async def record_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
     line = describe_message(msg, context.bot.username)
     if not line:
         return  # service messages: someone joined, the title changed...
-    who = msg.from_user.first_name if msg.from_user else "кто-то"
+    who = display_name(msg.from_user)
     replied = msg.reply_to_message
     if replied and replied.from_user:
         # "Вася → Лена": names can't be declined automatically, an arrow reads fine
-        target = "Гойдик" if replied.from_user.username == context.bot.username else replied.from_user.first_name
+        target = "Гойдик" if replied.from_user.username == context.bot.username else replied.from_user.full_name
         who = f"{who} → {target}"
     remember(context.chat_data, msg.message_id, who, line)
 
@@ -264,7 +271,7 @@ async def talk(msg, text, context):
     if not goydik.enabled():
         await msg.reply_text(GOYDIK_ASLEEP)
         return
-    author = msg.from_user.first_name if msg.from_user else "кто-то"
+    author = display_name(msg.from_user)
     in_group = msg.chat.type != Chat.PRIVATE
     if in_group:
         # The group log already has earlier questions and Гойдик's answers
@@ -297,7 +304,7 @@ def with_reply(text, replied, username):
         return text
     if replied.from_user.username == username:
         return text  # reply to Гойдик himself: it's already in the history
-    who = replied.from_user.first_name
+    who = display_name(replied.from_user)
     quoted = replied.text or replied.caption
     if quoted:
         if not text:
