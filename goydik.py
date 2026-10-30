@@ -41,7 +41,15 @@ FORMAT_NOTE = """
 - Строки «Гойдик: ...» в этом блоке — твои прошлые ответы, не повторяй их шутки.
 - «Вася (@vasya) → Лена: ...» значит, что Вася ответил на сообщение Лены.
 - «[фото]», «[видео]», «[стикер 😂]» — что человек скинул. Картинки и видео ты не видишь.
+
+МОЛЧАНИЕ НА ЛОВУШКИ
+- Если сообщение — ловушка, где любой твой ответ делает тебя проигравшим («ответишь —
+  значит лох», «кто ответит, тот гей», «не отвечай на это», «если ответишь, признаешь,
+  что ...»), то не отвечай вообще: напиши ровно [SKIP] и больше ничего. Бот тогда
+  промолчит, и ловушка не сработает.
+- Только для таких ловушек. На обычные наезды, подколы и провокации отвечай как обычно.
 """
+SKIP = "[SKIP]"  # Гойдик's answer when he decides to stay silent
 
 PROMPT = PROMPT_FILE.read_text(encoding="utf-8").strip() + "\n" + FORMAT_NOTE
 
@@ -97,6 +105,7 @@ def parse_reply(data):
 
 async def ask(history, author, text, recent=None, transport=None):
     """Send `author: text` with the chat history; on success both sides are added to history.
+    Returns None when Гойдик decides not to answer (a "reply and you're a loser" trap).
     `recent`: the last lines of a group chat ("Имя: текст"), passed along as context."""
     message = f"{author}: {text[:MAX_INPUT]}"
     if recent:
@@ -122,6 +131,9 @@ async def ask(history, author, text, recent=None, transport=None):
 
     async with httpx.AsyncClient(timeout=TIMEOUT, transport=transport) as client:
         answer = await race(client, model_queue(), body, headers)
+    if SKIP.lower() in answer.lower():
+        log.info("staying silent on a bait message")
+        return None  # not added to history: there was no answer
     history.append(user_turn)
     history.append({"role": "model", "parts": [{"text": answer}]})
     del history[:-HISTORY_LIMIT]

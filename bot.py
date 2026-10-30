@@ -289,6 +289,8 @@ async def talk(msg, text, context):
     except Exception:
         log.exception("goydik failed")
         answer = goydik.BROKEN
+    if answer is None:
+        return  # a "reply and you're a loser" trap: Гойдик doesn't take the bait
     sent = await msg.reply_text(answer)
     if ok and in_group and sent:
         # The bot doesn't receive its own messages, so add the answer to the log by hand
