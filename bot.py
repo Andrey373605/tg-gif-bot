@@ -8,7 +8,7 @@ Env:
                     (on Render it's taken from RENDER_EXTERNAL_URL automatically);
                     if empty, the bot runs in polling mode (for local runs)
     PORT            port for webhook mode (Render sets it)
-    ADMIN_CHAT_ID   chat id that receives /inc reports (send /id to the bot to learn yours)
+    ADMIN_CHAT_ID   chat or channel id that receives /inc reports (send /id there to learn it)
 """
 import asyncio
 import hashlib
@@ -55,7 +55,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def show_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"chat id этого чата: {update.effective_chat.id}")
+    # effective_message: in a channel the command arrives as channel_post, not message
+    await update.effective_message.reply_text(f"chat id этого чата: {update.effective_chat.id}")
 
 
 def describe_user(user):
@@ -212,21 +213,29 @@ async def set_commands(app):
     ])
 
 
-def main():
-    token = os.environ["BOT_TOKEN"]
-    # Python 3.14 no longer creates a loop implicitly, PTB expects one
-    asyncio.set_event_loop(asyncio.new_event_loop())
+def build_app(token):
     app = Application.builder().token(token).post_init(set_commands).build()
-    app.add_handler(CommandHandler(["start", "help"], start))
-    app.add_handler(CommandHandler("inc", report_incident))
-    app.add_handler(CommandHandler("id", show_id))
+    # Only new messages in chats with the bot. Without this the bot would also answer
+    # posts in the incidents channel and crash on edited messages (update.message is None there)
+    new_msg = filters.UpdateType.MESSAGE
+    app.add_handler(CommandHandler(["start", "help"], start, filters=new_msg))
+    app.add_handler(CommandHandler("inc", report_incident, filters=new_msg))
+    app.add_handler(CommandHandler("id", show_id, filters=new_msg | filters.UpdateType.CHANNEL_POST))
     media = (
         filters.PHOTO | filters.ANIMATION | filters.VIDEO | filters.VIDEO_NOTE
         | filters.Sticker.ALL | filters.Document.ALL
     )
-    app.add_handler(MessageHandler(media, handle_media))
-    app.add_handler(MessageHandler(filters.Entity("url") | filters.Entity("text_link"), handle_link))
-    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, start))
+    app.add_handler(MessageHandler(new_msg & media, handle_media))
+    app.add_handler(MessageHandler(new_msg & (filters.Entity("url") | filters.Entity("text_link")), handle_link))
+    app.add_handler(MessageHandler(new_msg & ~filters.COMMAND, start))
+    return app
+
+
+def main():
+    token = os.environ["BOT_TOKEN"]
+    # Python 3.14 no longer creates a loop implicitly, PTB expects one
+    asyncio.set_event_loop(asyncio.new_event_loop())
+    app = build_app(token)
 
     webhook_url = os.environ.get("WEBHOOK_URL") or os.environ.get("RENDER_EXTERNAL_URL")
     if webhook_url:
