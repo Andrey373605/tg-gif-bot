@@ -69,6 +69,10 @@ PROMPT = """\
 BLOCKED = "не-не, про это я даже бухой говорить не буду 🙅"
 TIRED = "гойдик перебрал, дай ему минутку отдышаться 🥴"
 BROKEN = "гойдик упал под стол, попробуй чуть позже 😵"
+SLOW = "гойдик задумался и уснул прямо за столом 😴 спроси ещё раз"
+
+TIMEOUT = 45  # seconds; Telegram users won't wait longer anyway
+THINKING_LEVEL = "low"  # the lowest level gemini-3.8-flash allows
 
 
 class GoydikError(Exception):
@@ -113,13 +117,32 @@ async def ask(history, author, text, recent=None, transport=None):
     body = {
         "system_instruction": {"parts": [{"text": PROMPT}]},
         "contents": history + [user_turn],
-        "generationConfig": {"temperature": 1.1, "maxOutputTokens": 2048},
+        "generationConfig": {
+            "temperature": 1.1,
+            "maxOutputTokens": 2048,
+            # 3.x Flash models think at "medium" by default, which can take a minute on a long
+            # group context; a drunk friend doesn't need deep reasoning
+            "thinkingConfig": {"thinkingLevel": THINKING_LEVEL},
+        },
         # Friendly swearing sometimes trips the default harassment filter
         "safetySettings": [{"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_ONLY_HIGH"}],
     }
     headers = {"x-goog-api-key": os.environ["GEMINI_API_KEY"]}
-    async with httpx.AsyncClient(timeout=60, transport=transport) as client:
-        r = await client.post(API_URL.format(model=model), json=body, headers=headers)
+    url = API_URL.format(model=model)
+    try:
+        async with httpx.AsyncClient(timeout=TIMEOUT, transport=transport) as client:
+            r = await client.post(url, json=body, headers=headers)
+            if r.status_code == 400 and "thinking" in r.text.lower():
+                # A model set via GEMINI_MODEL may not know this level: ask with its defaults
+                log.warning("model %s rejected thinkingLevel=%s, retrying without it", model, THINKING_LEVEL)
+                del body["generationConfig"]["thinkingConfig"]
+                r = await client.post(url, json=body, headers=headers)
+    except httpx.TimeoutException:
+        log.warning("gemini (model %s) didn't answer in %ss", model, TIMEOUT)
+        raise GoydikError(SLOW)
+    except httpx.TransportError as e:
+        log.warning("gemini (model %s) connection failed: %r", model, e)
+        raise GoydikError(BROKEN)
 
     if r.status_code == 429:
         raise GoydikError(TIRED)
