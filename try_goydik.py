@@ -59,6 +59,18 @@ CASES = [
 ]
 PAUSE = 8  # seconds between messages (two requests each): the free tier allows only a few per minute
 
+# Stand-ins for the chat's GIF collection: descriptions like the ones Gemini writes
+GIFS = [{"id": f"test{n}", "about": about} for n, about in enumerate([
+    "мужик в костюме медленно аплодирует с каменным лицом",
+    "кот падает со стола и делает вид, что так и задумано",
+    "Джон Траволта растерянно оглядывается по сторонам",
+    "собака в горящей комнате пьёт кофе, надпись «this is fine»",
+    "пикачу с открытым ртом в шоке",
+    "дед машет рукой и уходит, мол, да ну вас",
+    "строитель роняет кирпич себе на ногу",
+    "девушка закатывает глаза",
+], 1)]
+
 # A group conversation: Гойдик's answers go into the log, like in the real chat
 DIALOG = [
     ("Артём", "реал опять выиграл, бесит"),
@@ -74,17 +86,22 @@ async def answer(who, text, recent, indent):
     """Ask Гойдик and print the drafted options, the judge's pick and the final answer."""
     trace = {}
     try:
-        reply = await goydik.ask([], PEOPLE[who], text, recent=recent, trace=trace)
+        reply = await goydik.ask([], PEOPLE[who], text, recent=recent, gifs=GIFS, trace=trace)
     except goydik.GoydikError as e:
-        reply = f"(ошибка: {e})"
+        reply = goydik.Reply(f"(ошибка: {e})")
     problems = {v.get("option"): v.get("problem") for v in trace.get("verdicts", []) if isinstance(v, dict)}
     for n, option in enumerate(trace.get("options", []), 1):
         mark = "→" if n == trace.get("choice") else " "
         problem = f"   ✗ {problems[n]}" if problems.get(n) else ""
         facts = f" ({', '.join(option['facts'])})" if option.get("facts") else ""
-        print(f"{indent}  {mark} {n}. [{option['reaction']}]{facts} {option['text']}{problem}")
-    print(f"{indent}Гойдик: {reply if reply is not None else '(промолчал)'}")
-    return reply
+        gif = f" [гифка: {GIFS[option['gif'] - 1]['about']}]" if option.get("gif") else ""
+        print(f"{indent}  {mark} {n}. [{option['reaction']}]{facts}{gif} {option['text']}{problem}")
+    if reply is None:
+        said = "(промолчал)"
+    else:
+        said = f"[гифка: {reply.gif['about']}] {reply.text}".strip() if reply.gif else reply.text
+    print(f"{indent}Гойдик: {said}")
+    return said
 
 
 async def single(n, who, text):

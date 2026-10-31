@@ -13,6 +13,8 @@ Env:
     PORT            port for webhook mode (Render sets it)
     ADMIN_CHAT_ID   chat or channel id that receives /inc reports (send /id there to learn it)
     GEMINI_API_KEY  enables Гойдик, see goydik.py
+    GIF_STORAGE_CHAT_ID  chat where Гойдик keeps the group GIFs he learned, by default
+                    ADMIN_CHAT_ID, see gifs.py
 """
 import asyncio
 import hashlib
@@ -30,6 +32,7 @@ from telegram.constants import ChatAction
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 import goydik
+from gifs import MAX_SIZE as MAX_GIF_TO_LEARN, STORE as GIFS
 from links import LinkError, download
 from tg_gif import convert
 
@@ -268,6 +271,32 @@ async def record_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
         target = "Гойдик" if replied.from_user.username == context.bot.username else replied.from_user.full_name
         who = f"{who} → {target}"
     remember(context.chat_data, msg.message_id, who, line)
+    if msg.animation and goydik.enabled():
+        context.application.create_task(learn_gif(context.bot, context.chat_data, msg))
+
+
+async def learn_gif(bot, chat_data, msg):
+    """Remember a GIF sent to the group, with Gemini's description of what's on it: Гойдик
+    can send it back later, and the chat log shows «[гифка: ...]» instead of a bare «[гифка]»."""
+    anim = msg.animation
+    gif = GIFS.find(msg.chat_id, anim.file_unique_id)
+    if not gif:
+        if (anim.file_size or 0) > MAX_GIF_TO_LEARN:
+            return
+        hint = " ".join(filter(None, [msg.caption, anim.file_name]))
+        try:
+            async with GIFS.describing:
+                data = await (await bot.get_file(anim.file_id)).download_as_bytearray()
+                about = await goydik.describe_gif(bytes(data), anim.mime_type or "video/mp4", hint)
+        except Exception:
+            log.warning("couldn't describe a GIF", exc_info=True)
+            return
+        GIFS.add(msg.chat_id, anim.file_id, anim.file_unique_id, about)
+        GIFS.schedule_save(bot)
+        gif = GIFS.find(msg.chat_id, anim.file_unique_id)
+    for entry in chat_data.get("recent", ()):
+        if entry["id"] == msg.message_id:
+            entry["text"] = entry["text"].replace("[гифка]", f"[гифка: {gif['about']}]", 1)
 
 
 def recent_lines(chat_data, exclude_id):
@@ -299,24 +328,40 @@ async def talk(msg, text, context):
     typing = asyncio.create_task(keep_typing(context.bot, msg.chat_id))
     ok = False
     try:
-        answer = await goydik.ask(history, author, text, recent=recent)
+        # GIFs are collected in groups only, each group has its own
+        gifs = GIFS.choices(msg.chat_id) if in_group else None
+        reply = await goydik.ask(history, author, text, recent=recent, gifs=gifs)
         ok = True
     except goydik.GoydikError as e:
-        answer = str(e)
+        reply = goydik.Reply(str(e))
     except Exception:
         log.exception("goydik failed")
-        answer = goydik.BROKEN
+        reply = goydik.Reply(goydik.BROKEN)
     finally:
         typing.cancel()
-    if answer is None:
+    if reply is None:
         # A "reply and you're a loser" trap: Гойдик doesn't take the bait. Drop it from the
         # group log too, or Gemini keeps seeing it and stays silent on every next message
         forget(context.chat_data, msg.message_id)
         return
-    sent = await msg.reply_text(answer)
+    sent = await send_gif(msg, reply) if reply.gif else None
+    if sent:
+        said = f"[гифка: {reply.gif['about']}] {reply.text}".strip()
+    else:
+        said = reply.text or "🗿"  # a GIF without a caption that couldn't be sent
+        sent = await msg.reply_text(said)
     if ok and in_group and sent:
         # The bot doesn't receive its own messages, so add the answer to the log by hand
-        remember(context.chat_data, sent.message_id, "Гойдик", answer)
+        remember(context.chat_data, sent.message_id, "Гойдик", said)
+
+
+async def send_gif(msg, reply):
+    """Send the GIF Гойдик picked; None if Telegram no longer has it (then he answers with text)."""
+    try:
+        return await msg.reply_animation(reply.gif["id"], caption=reply.text or None)
+    except Exception:
+        log.warning("couldn't send a GIF from the collection", exc_info=True)
+        return None
 
 
 CALLED_EMPTY = "(тебя просто позвали, ничего не написав)"
@@ -457,7 +502,7 @@ async def report_incident(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --- Setup ----------------------------------------------------------------------------
 
 
-async def set_commands(app):
+async def startup(app):
     # The menu next to the input field in Telegram
     await app.bot.set_my_commands([
         BotCommand("gif", "Сделать гифку из картинки, видео или ссылки"),
@@ -465,12 +510,21 @@ async def set_commands(app):
         BotCommand("inc", "Сообщить о проблеме"),
         BotCommand("help", "Что умеет бот"),
     ])
+    await GIFS.load(app.bot)
+
+
+async def shutdown(app):
+    # Render stops the instance when it falls asleep: save GIFs learned in the last seconds
+    await GIFS.flush(app.bot)
 
 
 def build_app(token):
     # A few updates at once, so one long video doesn't block everyone else.
     # Not more: parallel ffmpeg runs would eat the free instance's memory
-    app = Application.builder().token(token).post_init(set_commands).concurrent_updates(4).build()
+    app = (
+        Application.builder().token(token).post_init(startup).post_shutdown(shutdown)
+        .concurrent_updates(4).build()
+    )
     # Only new messages. Without this the bot would also answer posts in the incidents
     # channel and crash on edited messages (update.message is None there)
     new_msg = filters.UpdateType.MESSAGE

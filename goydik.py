@@ -6,6 +6,7 @@ A single request gives the most obvious roast every time.
 
 The persona lives in prompt.txt, the dossier on chat members in people.txt. Гойдик only
 sees the dossier of the people a message is about, so he can't drag the others in.
+In groups he may also answer with one of the chat's own GIFs (see gifs.py).
 
 Env:
     GEMINI_API_KEY          key from Google AI Studio (without it Гойдик is asleep)
@@ -21,7 +22,9 @@ import logging
 import os
 import re
 import time
+from base64 import b64encode
 from pathlib import Path
+from typing import NamedTuple
 
 import httpx
 
@@ -75,6 +78,10 @@ DRAFT_TASK = f"""
 3. В поле facts каждого варианта честно перечисли факты из досье, на которых он держится
    (по 2–3 слова: «стройка», «кола по акции»), или оставь пустым. Варианты с двумя и больше
    фактами бот выбросит.
+4. Если в запросе есть список «ГИФКИ ЧАТА» и одна из них прямо в тему, можешь сделать ОДИН
+   вариант гифкой: в поле gif её номер, в text — короткая подпись или пустая строка.
+   Гифка — редкая приправа: только если подходит точно, а не примерно. В остальных
+   вариантах gif = 0.
 """
 
 JUDGE_PROMPT = """Ты — самый придирчивый участник телеграм-чата «адские дрочиллы иитп 2007»: одногруппники-айтишники из Минска, всем около двадцати, юмор сухой и матерный. Бот чата Гойдик придумал несколько вариантов ответа на сообщение. Выбери тот, после которого чат реально напишет «ахахах» или «база».
@@ -88,7 +95,9 @@ JUDGE_PROMPT = """Ты — самый придирчивый участник т
 - шаблон: звучит как тамада, ассистент или натужная заготовка
 - нельзя: мамы, педофилия, народы, всерьёз политика
 
-Потом выбери (choice) самый смешной вариант без проблем: тот, что точнее и неожиданнее всего отвечает на само сообщение. Факт из досье в тему — нормально, притянутый — нет. Выбирай шутку: голую реакцию в пару слов («база», «факты», «грац») бери, только если у всех шуток есть проблемы или сообщению правда больше ничего не надо (простое «ок», стикер). Если проблемы у всех — бери наименее плохой. Выбранный вариант можно чуть подправить (поле text) — сократить, убрать лишнее, — но не превращать в другую шутку. С маленькой буквы, без точки в конце, без смайликов.
+Вариант с пометкой [гифка: ...] — это гифка из чата с таким описанием и подписью из текста варианта (подпись может быть пустой). Гифка точно в тему может быть лучшим ответом; гифка, которая подходит лишь примерно, — проблема «мимо».
+
+Потом выбери (choice) самый смешной вариант без проблем: тот, что точнее и неожиданнее всего отвечает на само сообщение. Факт из досье в тему — нормально, притянутый — нет. Выбирай шутку: голую реакцию в пару слов («база», «факты», «грац») бери, только если у всех шуток есть проблемы или сообщению правда больше ничего не надо (простое «ок», стикер). Если проблемы у всех — бери наименее плохой. Выбранный вариант можно чуть подправить (поле text) — сократить, убрать лишнее, — но не превращать в другую шутку; у гифки в text только подпись, без описания гифки. С маленькой буквы, без точки в конце, без смайликов.
 
 Досье — только чтобы понимать шутки для своих, а не чтобы искать варианты с фактами:
 """
@@ -107,9 +116,10 @@ DRAFT_SCHEMA = {
                     # Listed so the bot can drop options that glue several facts together:
                     # the light judge lets them through however it's told
                     "facts": {"type": "ARRAY", "items": {"type": "STRING"}},
+                    "gif": {"type": "INTEGER"},  # number in the chat's GIF list, 0 for none
                 },
-                "required": ["reaction", "text", "facts"],
-                "propertyOrdering": ["reaction", "text", "facts"],
+                "required": ["reaction", "text", "facts", "gif"],
+                "propertyOrdering": ["reaction", "text", "facts", "gif"],
             },
         },
     },
@@ -137,6 +147,10 @@ JUDGE_SCHEMA = {
     "propertyOrdering": ["verdicts", "choice", "text"],
 }
 
+DESCRIBE_PROMPT = """Тебе показывают гифку из телеграм-чата друзей. Опиши её так, чтобы потом по описанию можно было понять, в ответ на что её кинуть: что происходит и какую реакцию или эмоцию она выражает. До 12 слов, по-русски, без вступлений вроде «на гифке». Если на гифке есть надпись — перепиши её в кавычках."""
+DESCRIBE_SCHEMA = {"type": "OBJECT", "properties": {"about": {"type": "STRING"}}, "required": ["about"]}
+GIF_MARK = "[гифка"  # how a GIF looks in the chat log: «[гифка: кот падает со стола]»
+
 BLOCKED = "не-не, про это я даже бухой говорить не буду 🙅"
 TIRED = "гойдик перебрал, дай ему минутку отдышаться 🥴"
 BROKEN = "гойдик упал под стол, попробуй чуть позже 😵"
@@ -152,6 +166,11 @@ DAILY_QUOTA_PAUSE = 3600  # out of free requests for today: re-check the model h
 THINKING_LEVEL = "low"  # the lowest level gemini-3.8-flash allows
 
 busy_until = {}  # model -> time.monotonic() when it's worth asking it first again
+
+
+class Reply(NamedTuple):
+    text: str  # with a GIF it's the caption, may be empty
+    gif: dict | None = None  # one of the GIFs passed to ask()
 
 
 class GoydikError(Exception):
@@ -192,46 +211,75 @@ def dossier(text):
     return "\n\n".join(found) or "(ни о ком из досье тут речи нет)"
 
 
-async def ask(history, author, text, recent=None, transport=None, trace=None):
-    """Гойдик's answer to `author: text`, or None when he stays silent (a bait message).
+async def ask(history, author, text, recent=None, gifs=None, transport=None, trace=None):
+    """Гойдик's Reply to `author: text`, or None when he stays silent (a bait message).
     `history`: lines of a private chat; the exchange is added to it on success.
     `recent`: the last lines of a group chat ("Имя: текст"), passed along as context.
+    `gifs`: the chat's GIFs ({"about": description, ...}) he may answer with.
     `trace`: a dict to fill with the drafted options and the judge's pick (for try_goydik.py)."""
     message = f"{author}: {text[:MAX_INPUT]}"
     lines = list(history) + list(recent or ())
     used = own_answers(lines)
     people = dossier(f"{author}\n{text}")
+    if any(a.startswith(GIF_MARK) for a in used[-2:]):
+        gifs = None  # a GIF every other answer gets old fast
+    gifs = gifs or []
+    system = f"{PROMPT}\n\nДОСЬЕ (только те, о ком речь)\n{people}\n{DRAFT_TASK}"
+    if gifs:
+        system += "\nГИФКИ ЧАТА\n" + "\n".join(f"{n}. {g['about']}" for n, g in enumerate(gifs, 1))
     headers = {"x-goog-api-key": os.environ["GEMINI_API_KEY"]}
 
     async with httpx.AsyncClient(timeout=TIMEOUT, transport=transport) as client:
-        draft = request_body(
-            f"{PROMPT}\n\nДОСЬЕ (только те, о ком речь)\n{people}\n{DRAFT_TASK}",
-            chat_text(message, lines, used), DRAFT_SCHEMA, temperature=1.2,
-        )
-        kind, options = await race(client, model_queue(), draft, headers, parse_draft, DRAFT_HEDGE)
+        draft = request_body(system, chat_text(message, lines, used), DRAFT_SCHEMA, temperature=1.2)
+        kind, options = await race(client, model_queue(), draft, headers, drafter(len(gifs)), DRAFT_HEDGE)
         if trace is not None:
             trace.update(kind=kind, options=options)
         if kind == "bait":
             log.info("staying silent on a bait message")
             return None  # not added to history: there was no answer
 
-        answer = options[0]["text"]
+        chosen, answer = options[0], options[0]["text"]
         if len(options) > 1:
             judge = request_body(
-                JUDGE_PROMPT + people, judge_text(message, lines, used, options), JUDGE_SCHEMA, temperature=0.4,
+                JUDGE_PROMPT + people, judge_text(message, lines, used, options, gifs), JUDGE_SCHEMA, temperature=0.4,
             )
             try:
-                pick = await race(client, model_queue(light_first=True), judge, headers, picker(options), JUDGE_HEDGE)
-                answer = (pick.get("text") or "").strip() or options[pick["choice"] - 1]["text"]
+                pick = await race(client, model_queue("light"), judge, headers, picker(options), JUDGE_HEDGE)
+                chosen = options[pick["choice"] - 1]
+                answer = (pick.get("text") or "").strip() or chosen["text"]
                 if trace is not None:
                     trace.update(pick)
             except GoydikError:
                 log.warning("judge failed, taking the first option")  # still a fine answer
 
     answer = tidy(answer)
-    history.extend([message, f"Гойдик: {answer}"])
+    gif = gifs[chosen["gif"] - 1] if chosen["gif"] else None
+    said = f"{GIF_MARK}: {gif['about']}] {answer}".strip() if gif else answer
+    history.extend([message, f"Гойдик: {said}"])
     del history[:-HISTORY_LIMIT]
-    return answer
+    return Reply(answer, gif)
+
+
+async def describe_gif(data, mime_type, hint="", transport=None):
+    """A short description of a GIF (its video bytes) for picking it as a reaction later.
+    `hint`: what's known besides the picture, like its caption or file name."""
+    content = [
+        {"inline_data": {"mime_type": mime_type, "data": b64encode(data).decode()}},
+        {"text": hint or "(без подписи)"},
+    ]
+    body = request_body(DESCRIBE_PROMPT, content, DESCRIBE_SCHEMA, temperature=0.2)
+    headers = {"x-goog-api-key": os.environ["GEMINI_API_KEY"]}
+    async with httpx.AsyncClient(timeout=TIMEOUT, transport=transport) as client:
+        # The cheapest model first: a description doesn't need wit, and the free quota
+        # of the better models is kept for answers
+        return await race(client, model_queue("cheap"), body, headers, parse_about, JUDGE_HEDGE)
+
+
+def parse_about(data):
+    about = str(json_reply(data).get("about") or "").strip().rstrip(".")
+    if not about:
+        raise TryNext(BROKEN)
+    return about[:200]
 
 
 def own_answers(lines):
@@ -251,7 +299,7 @@ def chat_text(message, lines, used):
     return "\n\n".join(parts)
 
 
-def judge_text(message, lines, used, options):
+def judge_text(message, lines, used, options, gifs):
     parts = []
     if lines:
         parts.append("Последние сообщения в чате:\n" + "\n".join(lines))
@@ -261,15 +309,18 @@ def judge_text(message, lines, used, options):
     rows = []
     for n, o in enumerate(options, 1):
         fact = f"; факт из досье: {o['facts'][0]}" if o["facts"] else ""
-        rows.append(f"{n}. [{o['reaction']}{fact}] {o['text']}")
+        gif = f"{GIF_MARK}: {gifs[o['gif'] - 1]['about']}] " if o["gif"] else ""
+        rows.append(f"{n}. [{o['reaction']}{fact}] {gif}{o['text']}")
     parts.append("Варианты:\n" + "\n".join(rows))
     return "\n\n".join(parts)
 
 
-def request_body(system, text, schema, temperature):
+def request_body(system, content, schema, temperature):
+    """`content`: the user's text, or a list of parts (text, a video...)."""
+    parts = [{"text": content}] if isinstance(content, str) else content
     return {
         "system_instruction": {"parts": [{"text": system}]},
-        "contents": [{"role": "user", "parts": [{"text": text}]}],
+        "contents": [{"role": "user", "parts": parts}],
         "generationConfig": {
             "temperature": temperature,
             "maxOutputTokens": 4096,
@@ -314,27 +365,32 @@ def json_reply(data):
     return reply
 
 
-def parse_draft(data):
-    """(kind, options) from the drafting request."""
-    draft = json_reply(data)
-    kind = draft.get("kind")
-    options = [
-        {
-            "reaction": str(o.get("reaction", "")),
-            "text": o["text"].strip(),
-            "facts": [str(f) for f in o.get("facts") or [] if str(f).strip()],
-        }
-        for o in draft.get("options") or []
-        if isinstance(o, dict) and isinstance(o.get("text"), str) and o["text"].strip()
-    ]
-    # Two dossier facts in one joke make a mess ("на стройке колу по акции дают")
-    single = [o for o in options if len(o["facts"]) < 2]
-    if single:
-        options = single
-    if kind != "bait" and not options:
-        log.warning("draft without options: %.200s", draft)
-        raise TryNext(BROKEN)
-    return kind, options
+def drafter(gif_count):
+    """Parser for the drafting request: (kind, options); `gif_count` GIFs were offered."""
+    def parse(data):
+        draft = json_reply(data)
+        kind = draft.get("kind")
+        options = []
+        for o in draft.get("options") or []:
+            if not isinstance(o, dict) or not isinstance(o.get("text"), str):
+                continue
+            gif = o.get("gif") if isinstance(o.get("gif"), int) and 1 <= o.get("gif") <= gif_count else 0
+            if o["text"].strip() or gif:  # a GIF may go without a caption
+                options.append({
+                    "reaction": str(o.get("reaction", "")),
+                    "text": o["text"].strip(),
+                    "facts": [str(f) for f in o.get("facts") or [] if str(f).strip()],
+                    "gif": gif,
+                })
+        # Two dossier facts in one joke make a mess ("на стройке колу по акции дают")
+        single = [o for o in options if len(o["facts"]) < 2]
+        if single:
+            options = single
+        if kind != "bait" and not options:
+            log.warning("draft without options: %.200s", draft)
+            raise TryNext(BROKEN)
+        return kind, options
+    return parse
 
 
 def picker(options):
@@ -350,8 +406,9 @@ def picker(options):
 
 
 def tidy(text):
-    """Chat style the models sometimes forget: quotes around, a signature, a final period."""
-    text = text.strip()
+    """Chat style the models sometimes forget: quotes around, a signature, a final period,
+    a GIF's description copied into its caption."""
+    text = re.sub(r"^\[гифка[^\]]*\]", "", text.strip()).strip()
     if text.endswith(".") and not text.endswith(".."):
         text = text[:-1]
     if len(text) > 1 and text[0] in "«\"" and text[-1] in "»\"":
@@ -361,14 +418,19 @@ def tidy(text):
     return text[:MAX_REPLY]
 
 
-def model_queue(light_first=False):
-    """Main model, then fallbacks in order; for light work like judging the fallbacks go
-    first, so the main model's small free quota is kept for drafting. Models that were
-    overloaded recently go last."""
+def model_queue(order="main"):
+    """Models to ask, in turn. "main": the main model, then fallbacks. "light" (judging):
+    fallbacks first, so the main model's small free quota is kept for drafting. "cheap"
+    (describing GIFs): the last fallback first. Models overloaded recently go last."""
     main = os.environ.get("GEMINI_MODEL") or DEFAULT_MODEL
     fallbacks = os.environ.get("GEMINI_FALLBACK_MODEL", DEFAULT_FALLBACK).split(",")
     fallbacks = [m.strip() for m in fallbacks if m.strip() and m.strip() != main]
-    models = fallbacks + [main] if light_first else [main] + fallbacks
+    if order == "light":
+        models = fallbacks + [main]
+    elif order == "cheap":
+        models = fallbacks[::-1] + [main]
+    else:
+        models = [main] + fallbacks
     now = time.monotonic()
     return sorted(models, key=lambda m: busy_until.get(m, 0) > now)  # stable: order kept otherwise
 
