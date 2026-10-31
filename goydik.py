@@ -1,16 +1,25 @@
 """Гойдик: the chat's friend who roasts everyone, on top of the Gemini API.
-The persona lives in prompt.txt.
+
+An answer takes two requests. First Гойдик drafts a few different answers (a roast,
+a laugh, a made-up story, a one-word reaction...), then a judge picks the funniest one.
+A single request gives the most obvious roast every time.
+
+The persona lives in prompt.txt, the dossier on chat members in people.txt. Гойдик only
+sees the dossier of the people a message is about, so he can't drag the others in.
 
 Env:
     GEMINI_API_KEY          key from Google AI Studio (without it Гойдик is asleep)
     GEMINI_MODEL            model name, default gemini-3.8-flash
-    GEMINI_FALLBACK_MODEL   asked when the main model is overloaded or out of quota,
-                            default gemini-3.5-flash-lite; empty value turns it off
+    GEMINI_FALLBACK_MODEL   asked when the main model is overloaded or out of quota, and
+                            asked first for judging; default gemini-3.5-flash-lite,
+                            empty value turns it off
 """
 import asyncio
 import copy
+import json
 import logging
 import os
+import re
 import time
 from pathlib import Path
 
@@ -24,45 +33,106 @@ DEFAULT_FALLBACK = "gemini-3.5-flash-lite"
 # Overloaded (503), internal error (500) or this model's free quota is over (429):
 # another model may still answer
 RETRY_STATUSES = {429, 500, 503}
-HISTORY_LIMIT = 20  # messages (user + model) remembered per chat
+HISTORY_LIMIT = 20  # lines of a private chat remembered
+RECENT_OWN = 4  # Гойдик's last answers quoted back to him as "already used"
+OPTIONS = 4  # answers drafted for the judge to choose from
 MAX_INPUT = 2000
 MAX_REPLY = 4000  # Telegram limit is 4096
 
 PROMPT_FILE = Path(__file__).with_name("prompt.txt")
+PEOPLE_FILE = Path(__file__).with_name("people.txt")
 
-# How the bot packs messages for Gemini. Lives here, not in prompt.txt,
+# How the bot packs messages and what it wants back. Lives here, not in prompt.txt,
 # so editing the persona can't break it
-FORMAT_NOTE = """
-ФОРМАТ СООБЩЕНИЙ
-- Сообщение тебе приходит в виде «Имя (@username): текст». Свой ответ именем не подписывай.
-- В групповом чате перед ним может быть блок «Последние сообщения в чате»: о чём болтали,
-  пока тебя не позвали. Используй его, чтобы понять, о чём речь, но отвечай только
-  на сообщение тебе и не пересказывай переписку.
-- Строки «Гойдик: ...» в этом блоке — твои прошлые ответы, не повторяй их шутки.
-- «Вася (@vasya) → Лена: ...» значит, что Вася ответил на сообщение Лены.
-- «[фото]», «[видео]», «[стикер 😂]» — что человек скинул. Картинки и видео ты не видишь.
+DRAFT_TASK = f"""
+КАК УСТРОЕН ЗАПРОС
+- Сообщение тебе приходит в виде «Имя (@username): текст». Перед ним может быть блок
+  последних сообщений: о чём болтали до тебя. Отвечай только на сообщение тебе.
+- «Гойдик: ...» — твои прошлые ответы. «Вася (@vasya) → Лена: ...» — Вася ответил Лене.
+  «[фото]», «[стикер 😂]» — что скинули; картинки и видео ты не видишь.
+- В конце может быть список твоих последних ответов: эти шутки, темы и словечки уже
+  отработаны, не повторяй их.
 
-МОЛЧАНИЕ НА ЛОВУШКИ
-- Если сообщение — ловушка, где любой твой ответ делает тебя проигравшим («ответишь —
-  значит лох», «кто ответит, тот гей», «не отвечай на это», «если ответишь, признаешь,
-  что ...»), то не отвечай вообще: напиши ровно [SKIP] и больше ничего. Бот тогда
-  промолчит, и ловушка не сработает.
-- Только для таких ловушек. На обычные наезды, подколы и провокации отвечай как обычно.
-- Решай только по сообщению тебе, не по блоку последних сообщений. Ловушка действует
-  на одно-единственное сообщение: даже если раньше в чате кто-то писал «ответишь — лох»,
-  на следующее обычное сообщение отвечай как всегда.
+ЗАДАЧА
+Сразу в чат ты не пишешь: сначала придумываешь варианты, потом из них выберут лучший.
+1. Определи, что это за сообщение (поле kind):
+   banter — потрындеть, подколоть, наехать, риторический вопрос;
+   question — человеку реально нужна инфа или помощь;
+   serious — человеку плохо или тема серьёзная;
+   bait — ловушка, где любой ответ делает тебя проигравшим («ответишь — лох», «кто ответит,
+   тот гей», «не отвечай на это»). Только такие ловушки, обычные наезды — это banter.
+   Решай по сообщению тебе, а не по блоку последних сообщений.
+2. Придумай {OPTIONS} совсем разных варианта ответа (поле options), у каждого своя реакция:
+   стёб, шутка без жертвы, поржать, реакция в одно-два слова, байка про себя, обида,
+   поддержка, удивление или встречный вопрос, затупить. Двух вариантов одной реакции не надо.
+   Для question каждый вариант содержит настоящий ответ, для serious — без стёба,
+   для bait варианты не нужны.
+   Факт из досье — максимум в одном варианте и только если он сам напрашивается.
 """
-SKIP = "[SKIP]"  # Гойдик's answer when he decides to stay silent
 
-PROMPT = PROMPT_FILE.read_text(encoding="utf-8").strip() + "\n" + FORMAT_NOTE
+JUDGE_PROMPT = """Ты — самый придирчивый участник телеграм-чата «адские дрочиллы иитп 2007»: одногруппники-айтишники из Минска, всем около двадцати, юмор сухой и матерный. Бот чата Гойдик придумал несколько вариантов ответа на сообщение. Выбери тот, после которого чат реально напишет «ахахах» или «база».
+
+Сначала проверь каждый вариант (поле verdicts): запиши его проблему или пустую строку, если проблем нет.
+- притянут факт: вариант шутит про работу, хобби или привычку человека, а в сообщении об этом ни слова и прямо из него это не следует. В тему, если сообщение про то же или факт прямо вытекает: «колу взял» → кола по акции, «реал выиграл» → барса, «нет времени» → работа, «наушники сдохли» → новые не купит. Притянуто: «сходил на концерт» → работа, «переезжаю» → тиктоки, «чел с попугаем в метро» → альтушки
+- повтор: та же тема, шутка или словечко, что в последних ответах Гойдика
+- длинно: больше одной мысли, объясняет шутку, нанизывает подколы
+- мимо: на реальный вопрос нет ответа, на серьёзное — стёб, или вообще не про сообщение
+- шаблон: звучит как тамада, ассистент или натужная заготовка
+- нельзя: мамы, педофилия, народы, всерьёз политика
+
+Потом выбери (choice) самый смешной вариант без проблем: тот, что точнее и неожиданнее всего отвечает на само сообщение. Факт из досье в тему — нормально, притянутый — нет. Смешная точная шутка лучше пустой реакции: «база», «грац», «понял» выбирай, только если шутки правда слабые или сообщению больше и не надо. Если проблемы у всех — бери наименее плохой. Выбранный вариант можно чуть подправить (поле text) — сократить, убрать лишнее, — но не превращать в другую шутку. С маленькой буквы, без точки в конце, без смайликов.
+
+Досье — только чтобы понимать шутки для своих, а не чтобы искать варианты с фактами:
+"""
+
+DRAFT_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "kind": {"type": "STRING", "enum": ["banter", "question", "serious", "bait"]},
+        "options": {
+            "type": "ARRAY",
+            "items": {
+                "type": "OBJECT",
+                "properties": {"reaction": {"type": "STRING"}, "text": {"type": "STRING"}},
+                "required": ["reaction", "text"],
+                "propertyOrdering": ["reaction", "text"],
+            },
+        },
+    },
+    "required": ["kind", "options"],
+    "propertyOrdering": ["kind", "options"],
+}
+# Checking every option for concrete problems before choosing: asked just "which is funniest",
+# the judge goes for whatever hits the dossier, however far-fetched
+JUDGE_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "verdicts": {
+            "type": "ARRAY",
+            "items": {
+                "type": "OBJECT",
+                "properties": {"option": {"type": "INTEGER"}, "problem": {"type": "STRING"}},
+                "required": ["option", "problem"],
+                "propertyOrdering": ["option", "problem"],
+            },
+        },
+        "choice": {"type": "INTEGER"},
+        "text": {"type": "STRING"},
+    },
+    "required": ["verdicts", "choice", "text"],
+    "propertyOrdering": ["verdicts", "choice", "text"],
+}
 
 BLOCKED = "не-не, про это я даже бухой говорить не буду 🙅"
 TIRED = "гойдик перебрал, дай ему минутку отдышаться 🥴"
 BROKEN = "гойдик упал под стол, попробуй чуть позже 😵"
 SLOW = "гойдик задумался и уснул прямо за столом 😴 спроси ещё раз"
 
-TIMEOUT = 30  # seconds per request
-HEDGE_AFTER = 8  # no answer by then: ask the next model too and take whichever answers first
+TIMEOUT = 45  # seconds per request
+# No answer by then: ask the next model too and take whichever answers first.
+# Drafting several answers takes the main model longer than picking one
+DRAFT_HEDGE = 20
+JUDGE_HEDGE = 8
 BUSY_FOR = 300  # an overloaded model goes to the back of the queue for this many seconds
 DAILY_QUOTA_PAUSE = 3600  # out of free requests for today: re-check the model hourly
 THINKING_LEVEL = "low"  # the lowest level gemini-3.8-flash allows
@@ -86,7 +156,117 @@ def enabled():
     return bool(os.environ.get("GEMINI_API_KEY"))
 
 
-def parse_reply(data):
+def load_people(path):
+    """[(pattern, dossier)] from people.txt: each person starts with «## Имя: шаблоны»."""
+    people = []
+    for block in re.split(r"^## ", path.read_text(encoding="utf-8"), flags=re.M)[1:]:
+        head, _, body = block.partition("\n")
+        name, _, patterns = head.partition(":")
+        pattern = re.compile(r"(?<!\w)(?:" + "|".join(patterns.split()) + ")", re.I)
+        facts = "\n".join(line for line in body.splitlines() if line.strip() and not line.startswith("#"))
+        people.append((pattern, f"{name.strip()}\n{facts}"))
+    return people
+
+
+PROMPT = PROMPT_FILE.read_text(encoding="utf-8").strip()
+PEOPLE = load_people(PEOPLE_FILE)
+
+
+def dossier(text):
+    """Dossier of the people `text` is about: the author and whoever is named in it."""
+    found = [facts for pattern, facts in PEOPLE if pattern.search(text)]
+    return "\n\n".join(found) or "(ни о ком из досье тут речи нет)"
+
+
+async def ask(history, author, text, recent=None, transport=None, trace=None):
+    """Гойдик's answer to `author: text`, or None when he stays silent (a bait message).
+    `history`: lines of a private chat; the exchange is added to it on success.
+    `recent`: the last lines of a group chat ("Имя: текст"), passed along as context.
+    `trace`: a dict to fill with the drafted options and the judge's pick (for try_goydik.py)."""
+    message = f"{author}: {text[:MAX_INPUT]}"
+    lines = list(history) + list(recent or ())
+    used = own_answers(lines)
+    people = dossier(f"{author}\n{text}")
+    headers = {"x-goog-api-key": os.environ["GEMINI_API_KEY"]}
+
+    async with httpx.AsyncClient(timeout=TIMEOUT, transport=transport) as client:
+        draft = request_body(
+            f"{PROMPT}\n\nДОСЬЕ (только те, о ком речь)\n{people}\n{DRAFT_TASK}",
+            chat_text(message, lines, used), DRAFT_SCHEMA, temperature=1.2,
+        )
+        kind, options = await race(client, model_queue(), draft, headers, parse_draft, DRAFT_HEDGE)
+        if trace is not None:
+            trace.update(kind=kind, options=options)
+        if kind == "bait":
+            log.info("staying silent on a bait message")
+            return None  # not added to history: there was no answer
+
+        answer = options[0]["text"]
+        if len(options) > 1:
+            judge = request_body(
+                JUDGE_PROMPT + people, judge_text(message, lines, used, options), JUDGE_SCHEMA, temperature=0.4,
+            )
+            try:
+                pick = await race(client, model_queue(light_first=True), judge, headers, picker(options), JUDGE_HEDGE)
+                answer = (pick.get("text") or "").strip() or options[pick["choice"] - 1]["text"]
+                if trace is not None:
+                    trace.update(pick)
+            except GoydikError:
+                log.warning("judge failed, taking the first option")  # still a fine answer
+
+    answer = tidy(answer)
+    history.extend([message, f"Гойдик: {answer}"])
+    del history[:-HISTORY_LIMIT]
+    return answer
+
+
+def own_answers(lines):
+    """Гойдик's last answers among the chat lines."""
+    return [line.split(": ", 1)[1] for line in lines if line.startswith("Гойдик: ")][-RECENT_OWN:]
+
+
+def chat_text(message, lines, used):
+    parts = []
+    if lines:
+        parts.append("Последние сообщения в чате, для контекста:\n" + "\n".join(lines))
+    parts.append("Сообщение тебе:\n" + message)
+    if used:
+        # Gemini keeps picking up its own recent jokes from the context; a reminder
+        # right before the answer works better than one in the system prompt
+        parts.append("Твои последние ответы (уже отработаны, не повторяй):\n" + "\n".join(f"- {a}" for a in used))
+    return "\n\n".join(parts)
+
+
+def judge_text(message, lines, used, options):
+    parts = []
+    if lines:
+        parts.append("Последние сообщения в чате:\n" + "\n".join(lines))
+    parts.append("Сообщение Гойдику:\n" + message)
+    if used:
+        parts.append("Последние ответы Гойдика:\n" + "\n".join(f"- {a}" for a in used))
+    parts.append("Варианты:\n" + "\n".join(f"{n}. [{o['reaction']}] {o['text']}" for n, o in enumerate(options, 1)))
+    return "\n\n".join(parts)
+
+
+def request_body(system, text, schema, temperature):
+    return {
+        "system_instruction": {"parts": [{"text": system}]},
+        "contents": [{"role": "user", "parts": [{"text": text}]}],
+        "generationConfig": {
+            "temperature": temperature,
+            "maxOutputTokens": 4096,
+            "responseMimeType": "application/json",
+            "responseSchema": schema,
+            # 3.x Flash models think at "medium" by default, which can take a minute on a long
+            # group context; a drunk friend doesn't need deep reasoning
+            "thinkingConfig": {"thinkingLevel": THINKING_LEVEL},
+        },
+        # Friendly swearing sometimes trips the default harassment filter
+        "safetySettings": [{"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_ONLY_HIGH"}],
+    }
+
+
+def reply_text(data):
     if (data.get("promptFeedback") or {}).get("blockReason"):
         raise GoydikError(BLOCKED)
     candidates = data.get("candidates") or []
@@ -101,60 +281,75 @@ def parse_reply(data):
             raise GoydikError(BLOCKED)
         log.warning("empty answer, finishReason=%s", cand.get("finishReason"))
         raise GoydikError(BROKEN)
+    return text
+
+
+def json_reply(data):
+    text = reply_text(data)
+    try:
+        reply = json.loads(text)
+    except json.JSONDecodeError:
+        reply = None
+    if not isinstance(reply, dict):
+        log.warning("answer is not a JSON object: %.200s", text)
+        raise TryNext(BROKEN)
+    return reply
+
+
+def parse_draft(data):
+    """(kind, options) from the drafting request."""
+    draft = json_reply(data)
+    kind = draft.get("kind")
+    options = [
+        {"reaction": str(o.get("reaction", "")), "text": o["text"].strip()}
+        for o in draft.get("options") or []
+        if isinstance(o, dict) and isinstance(o.get("text"), str) and o["text"].strip()
+    ]
+    if kind != "bait" and not options:
+        log.warning("draft without options: %.200s", draft)
+        raise TryNext(BROKEN)
+    return kind, options
+
+
+def picker(options):
+    """Parser for the judge's answer: {"verdicts", "choice", "text"} with a valid choice."""
+    def parse(data):
+        pick = json_reply(data)
+        choice = pick.get("choice")
+        if not isinstance(choice, int) or not 1 <= choice <= len(options):
+            log.warning("judge picked no option: %.200s", pick)
+            raise TryNext(BROKEN)
+        return pick
+    return parse
+
+
+def tidy(text):
+    """Chat style the models sometimes forget: quotes around, a signature, a final period."""
+    text = text.strip()
+    if text.endswith(".") and not text.endswith(".."):
+        text = text[:-1]
+    if len(text) > 1 and text[0] in "«\"" and text[-1] in "»\"":
+        text = text[1:-1].strip()
     if text.lower().startswith("гойдик:"):
         text = text.split(":", 1)[1].strip()
     return text[:MAX_REPLY]
 
 
-async def ask(history, author, text, recent=None, transport=None):
-    """Send `author: text` with the chat history; on success both sides are added to history.
-    Returns None when Гойдик decides not to answer (a "reply and you're a loser" trap).
-    `recent`: the last lines of a group chat ("Имя: текст"), passed along as context."""
-    message = f"{author}: {text[:MAX_INPUT]}"
-    if recent:
-        message = (
-            "Последние сообщения в чате, для контекста:\n" + "\n".join(recent)
-            + "\n\nСообщение тебе:\n" + message
-        )
-    user_turn = {"role": "user", "parts": [{"text": message}]}
-    body = {
-        "system_instruction": {"parts": [{"text": PROMPT}]},
-        "contents": history + [user_turn],
-        "generationConfig": {
-            "temperature": 1.1,
-            "maxOutputTokens": 2048,
-            # 3.x Flash models think at "medium" by default, which can take a minute on a long
-            # group context; a drunk friend doesn't need deep reasoning
-            "thinkingConfig": {"thinkingLevel": THINKING_LEVEL},
-        },
-        # Friendly swearing sometimes trips the default harassment filter
-        "safetySettings": [{"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_ONLY_HIGH"}],
-    }
-    headers = {"x-goog-api-key": os.environ["GEMINI_API_KEY"]}
-
-    async with httpx.AsyncClient(timeout=TIMEOUT, transport=transport) as client:
-        answer = await race(client, model_queue(), body, headers)
-    if SKIP.lower() in answer.lower():
-        log.info("staying silent on a bait message")
-        return None  # not added to history: there was no answer
-    history.append(user_turn)
-    history.append({"role": "model", "parts": [{"text": answer}]})
-    del history[:-HISTORY_LIMIT]
-    return answer
-
-
-def model_queue():
-    """Main model, then fallback; models that were overloaded recently go last."""
+def model_queue(light_first=False):
+    """Main model, then fallback (the other way round for light work like judging);
+    models that were overloaded recently go last."""
     models = [os.environ.get("GEMINI_MODEL") or DEFAULT_MODEL]
     fallback = os.environ.get("GEMINI_FALLBACK_MODEL", DEFAULT_FALLBACK)
     if fallback and fallback not in models:
         models.append(fallback)
+    if light_first:
+        models.reverse()
     now = time.monotonic()
     return sorted(models, key=lambda m: busy_until.get(m, 0) > now)  # stable: order kept otherwise
 
 
-async def race(client, models, body, headers):
-    """Ask models[0]; if it fails, or is silent for HEDGE_AFTER seconds, ask the next one too.
+async def race(client, models, body, headers, parse, hedge_after):
+    """Ask models[0]; if it fails, or is silent for `hedge_after` seconds, ask the next one too.
     The first proper answer wins, the rest are cancelled."""
     queue = list(models)
     running = set()
@@ -162,12 +357,12 @@ async def race(client, models, body, headers):
 
     def start_next():
         model = queue.pop(0)
-        running.add(asyncio.create_task(attempt(client, model, copy.deepcopy(body), headers)))
+        running.add(asyncio.create_task(attempt(client, model, copy.deepcopy(body), headers, parse)))
 
     start_next()
     try:
         while running:
-            wait = HEDGE_AFTER if queue else None
+            wait = hedge_after if queue else None
             done, _ = await asyncio.wait(running, timeout=wait, return_when=asyncio.FIRST_COMPLETED)
             if not done:
                 start_next()  # current model is taking too long, don't just wait for it
@@ -212,8 +407,8 @@ def error_info(r):
     return reason, wait
 
 
-async def attempt(client, model, body, headers):
-    """One model's answer; TryNext if another model may still help, GoydikError if not."""
+async def attempt(client, model, body, headers, parse):
+    """One model's parsed answer; TryNext if another model may still help, GoydikError if not."""
     url = API_URL.format(model=model)
     started = time.monotonic()
     try:
@@ -244,6 +439,6 @@ async def attempt(client, model, body, headers):
         # 400 "User location is not supported" and the like: another model won't help
         log.error("gemini %s (model %s): %s", r.status_code, model, error_info(r)[0])
         raise GoydikError(BROKEN)
-    answer = parse_reply(r.json())
+    answer = parse(r.json())
     log.info("answered by %s in %.1fs", model, time.monotonic() - started)
     return answer

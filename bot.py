@@ -223,7 +223,7 @@ MEDIA_MARKS = [
 
 
 def display_name(user):
-    """'Артём Стажер (@Blaugranass)': prompt.txt finds people in its dossier by name or username."""
+    """'Артём Стажер (@Blaugranass)': people.txt finds people in its dossier by name or username."""
     if user is None:
         return "кто-то"
     return f"{user.full_name} (@{user.username})" if user.username else user.full_name
@@ -274,6 +274,16 @@ def recent_lines(chat_data, exclude_id):
     return [f"{m['who']}: {m['text']}" for m in chat_data.get("recent", ()) if m["id"] != exclude_id]
 
 
+async def keep_typing(bot, chat_id):
+    """Telegram shows "typing..." for 5 seconds, and Гойдик thinks longer: two requests per answer."""
+    while True:
+        try:
+            await bot.send_chat_action(chat_id, ChatAction.TYPING)
+        except Exception:
+            log.warning("couldn't send typing action", exc_info=True)
+        await asyncio.sleep(4)
+
+
 async def talk(msg, text, context):
     if not goydik.enabled():
         await msg.reply_text(GOYDIK_ASLEEP)
@@ -286,7 +296,7 @@ async def talk(msg, text, context):
     else:
         history, recent = context.chat_data.setdefault("goydik_history", []), None
 
-    await context.bot.send_chat_action(msg.chat_id, ChatAction.TYPING)
+    typing = asyncio.create_task(keep_typing(context.bot, msg.chat_id))
     ok = False
     try:
         answer = await goydik.ask(history, author, text, recent=recent)
@@ -296,6 +306,8 @@ async def talk(msg, text, context):
     except Exception:
         log.exception("goydik failed")
         answer = goydik.BROKEN
+    finally:
+        typing.cancel()
     if answer is None:
         # A "reply and you're a loser" trap: Гойдик doesn't take the bait. Drop it from the
         # group log too, or Gemini keeps seeing it and stays silent on every next message
