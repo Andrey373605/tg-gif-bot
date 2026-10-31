@@ -16,6 +16,7 @@ import copy
 import json
 import logging
 import os
+import random
 import re
 import time
 from base64 import b64encode
@@ -71,7 +72,8 @@ FORMAT_NOTE = """
 
 ПЕРЕД ОТВЕТОМ ПРОВЕРЬ СЕБЯ
 - это ответ на то, что человек написал, а не заготовка?
-- есть шутка? Голое «база» или «найс» — только если сообщению правда больше ничего не надо
+- ответ в настрое, который указан в конце запроса? Подкалывать, когда настрой другой, — мимо
+- голое «база» или «найс» — только если сообщению правда больше ничего не надо
 - если взял факт из досье: он про то, о чём пишет человек, или прямо из этого вытекает?
   Факт один, а не два склеенных?
 - не повторяешь тему, факт или словечко из своих последних ответов?
@@ -92,6 +94,18 @@ ANSWER_SCHEMA = {
 DESCRIBE_PROMPT = """Тебе показывают гифку из телеграм-чата друзей. Опиши её так, чтобы потом по описанию можно было понять, в ответ на что её кинуть: что происходит и какую реакцию или эмоцию она выражает. До 12 слов, по-русски, без вступлений вроде «на гифке». Если на гифке есть надпись — перепиши её в кавычках."""
 DESCRIBE_SCHEMA = {"type": "OBJECT", "properties": {"about": {"type": "STRING"}}, "required": ["about"]}
 GIF_MARK = "[гифка"  # how a GIF looks in the chat log: «[гифка: кот падает со стола]»
+
+# Whatever the prompt says, Gemini drifts into roasting every message, and the chat got
+# tired of it. So each answer gets a mood drawn at random, and a roast is only one of them
+MOODS = [
+    ("поддержи разговор без подколов: своё мнение, встречный вопрос или реакция по теме", 3),
+    ("шутка без жертвы: смешное наблюдение или абсурд про саму ситуацию, никого не задевая", 3),
+    ("подыграй: продолжи мысль человека, как будто ты в теме", 2),
+    ("поддержи человека или порадуйся за него, по-дружески", 2),
+    ("короткая выдуманная история про себя в тему", 1),
+    ("удивись или загорись темой, переспроси", 1),
+    ("беззлобный дружеский подкол", 2),
+]
 
 BLOCKED = "не-не, про это я даже бухой говорить не буду 🙅"
 TIRED = "гойдик перебрал, дай ему минутку отдышаться 🥴"
@@ -170,13 +184,14 @@ async def ask(history, author, text, recent=None, gifs=None, note=None, transpor
     system = f"{PROMPT}\n\nДОСЬЕ (только те, о ком речь)\n{people}\n{FORMAT_NOTE}"
     if gifs:
         system += "\nГИФКИ ЧАТА\n" + "\n".join(f"{n}. {g['about']}" for n, g in enumerate(gifs, 1))
-    body = request_body(system, chat_text(message, lines, used), ANSWER_SCHEMA, temperature=1.1)
+    mood = random.choices([m for m, _ in MOODS], weights=[w for _, w in MOODS])[0]
+    body = request_body(system, chat_text(message, lines, used, mood), ANSWER_SCHEMA, temperature=1.1)
     headers = {"x-goog-api-key": os.environ["GEMINI_API_KEY"]}
 
     async with httpx.AsyncClient(timeout=TIMEOUT, transport=transport) as client:
         answer = await race(client, model_queue(), body, headers, answer_parser(len(gifs)))
     if trace is not None:
-        trace.update(answer)
+        trace.update(answer, mood=mood)
     if answer["kind"] == "bait":
         log.info("staying silent on a bait message")
         return None  # not added to history: there was no answer
@@ -231,7 +246,7 @@ def own_answers(lines):
     return [line.split(": ", 1)[1] for line in lines if line.startswith("Гойдик: ")][-RECENT_OWN:]
 
 
-def chat_text(message, lines, used):
+def chat_text(message, lines, used, mood):
     parts = []
     if lines:
         parts.append("Последние сообщения в чате, для контекста:\n" + "\n".join(lines))
@@ -240,6 +255,10 @@ def chat_text(message, lines, used):
         # Gemini keeps picking up its own recent jokes from the context; a reminder
         # right before the answer works better than one in the system prompt
         parts.append("Твои последние ответы (уже отработаны, не повторяй):\n" + "\n".join(f"- {a}" for a in used))
+    parts.append(
+        f"Настрой на этот ответ: {mood}. Если человеку реально нужна помощь или ему плохо — "
+        "забудь про настрой и ответь как надо."
+    )
     return "\n\n".join(parts)
 
 

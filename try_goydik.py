@@ -89,8 +89,9 @@ async def answer(who, text, recent, indent):
         reply = await goydik.ask([], PEOPLE[who], text, recent=recent, gifs=GIFS, trace=trace)
     except goydik.GoydikError as e:
         reply = goydik.Reply(f"(ошибка: {e})")
-    if trace.get("kind") and trace["kind"] != "banter":
-        print(f"{indent}  ({trace['kind']})")
+    if trace.get("mood"):
+        kind = f"{trace['kind']}; " if trace.get("kind") != "banter" else ""
+        print(f"{indent}  ({kind}настрой: {trace['mood'].split(':')[0]})")
     if reply is None:
         said = "(промолчал)"
     else:
