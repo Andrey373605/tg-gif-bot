@@ -278,25 +278,50 @@ async def record_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
 async def learn_gif(bot, chat_data, msg):
     """Remember a GIF sent to the group, with Gemini's description of what's on it: Гойдик
     can send it back later, and the chat log shows «[гифка: ...]» instead of a bare «[гифка]»."""
-    anim = msg.animation
-    gif = GIFS.find(msg.chat_id, anim.file_unique_id)
-    if not gif:
-        if (anim.file_size or 0) > MAX_GIF_TO_LEARN:
-            return
-        hint = " ".join(filter(None, [msg.caption, anim.file_name]))
-        try:
-            async with GIFS.describing:
-                data = await (await bot.get_file(anim.file_id)).download_as_bytearray()
-                about = await goydik.describe_gif(bytes(data), anim.mime_type or "video/mp4", hint)
-        except Exception:
-            log.warning("couldn't describe a GIF", exc_info=True)
-            return
-        GIFS.add(msg.chat_id, anim.file_id, anim.file_unique_id, about)
-        GIFS.schedule_save(bot)
-        gif = GIFS.find(msg.chat_id, anim.file_unique_id)
+    about = await gif_about(bot, msg.chat_id, msg.animation, msg.caption)
+    if not about:
+        return
     for entry in chat_data.get("recent", ()):
         if entry["id"] == msg.message_id:
-            entry["text"] = entry["text"].replace("[гифка]", f"[гифка: {gif['about']}]", 1)
+            entry["text"] = entry["text"].replace("[гифка]", f"[гифка: {about}]", 1)
+
+
+GIF_TIMEOUT = 30  # seconds for Telegram to hand over a GIF: the default 5 is often too little
+
+
+async def gif_about(bot, chat_id, anim, caption=None):
+    """What's on a GIF: from the collection, or asked from Gemini now and remembered.
+    None if it couldn't be described."""
+    gif = GIFS.find(chat_id, anim.file_unique_id)
+    if gif:
+        return gif["about"]
+    if (anim.file_size or 0) > MAX_GIF_TO_LEARN or not goydik.enabled():
+        return None
+    async with GIFS.describing:
+        # The same GIF may have been described while this one waited: one GIF is both
+        # learned in the background and answered to when it's sent to Гойдик
+        gif = GIFS.find(chat_id, anim.file_unique_id)
+        if gif:
+            return gif["about"]
+        hint = " ".join(filter(None, [caption, anim.file_name]))
+        try:
+            tg_file = await bot.get_file(anim.file_id, read_timeout=GIF_TIMEOUT)
+            data = await tg_file.download_as_bytearray(read_timeout=GIF_TIMEOUT)
+            about = await goydik.describe_gif(bytes(data), anim.mime_type or "video/mp4", hint)
+        except Exception:
+            log.warning("couldn't describe a GIF", exc_info=True)
+            return None
+        GIFS.add(chat_id, anim.file_id, anim.file_unique_id, about)
+    GIFS.schedule_save(bot)
+    return about
+
+
+async def replied_gif(bot, msg):
+    """Description of the GIF `msg` replies to, if it does."""
+    replied = msg.reply_to_message
+    if replied and replied.animation:
+        return await gif_about(bot, msg.chat_id, replied.animation, replied.caption)
+    return None
 
 
 def recent_lines(chat_data, exclude_id):
@@ -304,7 +329,7 @@ def recent_lines(chat_data, exclude_id):
 
 
 async def keep_typing(bot, chat_id):
-    """Telegram shows "typing..." for 5 seconds, and Гойдик thinks longer: two requests per answer."""
+    """Telegram shows "typing..." for 5 seconds, and Gemini often thinks longer."""
     while True:
         try:
             await bot.send_chat_action(chat_id, ChatAction.TYPING)
@@ -367,13 +392,18 @@ async def send_gif(msg, reply):
 CALLED_EMPTY = "(тебя просто позвали, ничего не написав)"
 
 
-def with_reply(text, replied, username):
-    """Add the message Гойдик was called on, so he knows what people are talking about."""
+def with_reply(text, replied, username, gif=None):
+    """Add the message Гойдик was called on, so he knows what people are talking about.
+    `gif`: the description of the GIF in that message, if there is one."""
     if not replied or not replied.from_user:
         return text
     if replied.from_user.username == username:
         return text  # reply to Гойдик himself: it's already in the history
     who = display_name(replied.from_user)
+    if gif:
+        caption = f" с подписью «{replied.caption}»" if replied.caption else ""
+        seen = f"{who} кинул гифку{caption}: {gif}"
+        return f"{text}\n(это в ответ на то, что {seen})" if text else f"чё скажешь: {seen}"
     quoted = replied.text or replied.caption
     if quoted:
         if not text:
@@ -402,7 +432,8 @@ def strip_mention(text, username):
 
 async def goydik_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
-    text = with_reply(command_text(msg), msg.reply_to_message, context.bot.username)
+    gif = await replied_gif(context.bot, msg)
+    text = with_reply(command_text(msg), msg.reply_to_message, context.bot.username, gif)
     if not text:
         await msg.reply_text(GOYDIK_USAGE)
         return
@@ -426,7 +457,12 @@ async def group_goydik(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not (mentions_bot(msg, username) or replies_to_goydik(msg, username)):
         return  # someone else was tagged or answered
     text = strip_mention(msg.text or msg.caption, username)
-    text = with_reply(text, msg.reply_to_message, username)
+    if msg.animation:
+        # A GIF sent to Гойдик: tell him what's on it, or he says he can't see it
+        about = await gif_about(context.bot, msg.chat_id, msg.animation, msg.caption)
+        mark = f"[гифка: {about}]" if about else "[гифка]"
+        text = f"{mark} {text}".strip()
+    text = with_reply(text, msg.reply_to_message, username, await replied_gif(context.bot, msg))
     # A reply with just a sticker or photo: tell Гойдик what it was
     text = text or describe_message(msg, username)
     # Just "@bot" with nothing else: Гойдик reacts to being called

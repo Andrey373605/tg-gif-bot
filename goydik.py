@@ -1,9 +1,5 @@
 """Гойдик: the chat's friend who roasts everyone, on top of the Gemini API.
 
-An answer takes two requests. First Гойдик drafts a few different answers (a roast,
-a laugh, a made-up story, a one-word reaction...), then a judge picks the funniest one.
-A single request gives the most obvious roast every time.
-
 The persona lives in prompt.txt, the dossier on chat members in people.txt. Гойдик only
 sees the dossier of the people a message is about, so he can't drag the others in.
 In groups he may also answer with one of the chat's own GIFs (see gifs.py).
@@ -12,8 +8,8 @@ Env:
     GEMINI_API_KEY          key from Google AI Studio (without it Гойдик is asleep)
     GEMINI_MODEL            model name, default gemini-3.8-flash
     GEMINI_FALLBACK_MODEL   comma-separated models asked in turn when the main one is
-                            overloaded or out of quota; they also go first for judging.
-                            Default gemini-3.6-flash,gemini-3.5-flash-lite, empty turns them off
+                            overloaded or out of quota. Default
+                            gemini-3.6-flash,gemini-3.5-flash-lite, empty turns them off
 """
 import asyncio
 import copy
@@ -40,7 +36,6 @@ DEFAULT_FALLBACK = "gemini-3.6-flash,gemini-3.5-flash-lite"
 RETRY_STATUSES = {429, 500, 503}
 HISTORY_LIMIT = 20  # lines of a private chat remembered
 RECENT_OWN = 4  # Гойдик's last answers quoted back to him as "already used"
-OPTIONS = 4  # answers drafted for the judge to choose from
 MAX_INPUT = 2000
 MAX_REPLY = 4000  # Telegram limit is 4096
 
@@ -49,102 +44,46 @@ PEOPLE_FILE = Path(__file__).with_name("people.txt")
 
 # How the bot packs messages and what it wants back. Lives here, not in prompt.txt,
 # so editing the persona can't break it
-DRAFT_TASK = f"""
+FORMAT_NOTE = """
 КАК УСТРОЕН ЗАПРОС
 - Сообщение тебе приходит в виде «Имя (@username): текст». Перед ним может быть блок
   последних сообщений: о чём болтали до тебя. Отвечай только на сообщение тебе.
 - «Гойдик: ...» — твои прошлые ответы. «Вася (@vasya) → Лена: ...» — Вася ответил Лене.
-  «[фото]», «[стикер 😂]» — что скинули; картинки и видео ты не видишь.
-- В конце может быть список твоих последних ответов: эти шутки, темы и словечки уже
-  отработаны, не повторяй их.
+  «[фото]», «[стикер 😂]» — что скинули; картинки и видео ты не видишь, а «[гифка: ...]» —
+  гифка с описанием того, что на ней: реагируй на неё как на увиденную. Голая «[гифка]» —
+  описать не вышло: отреагируй на сам факт гифки, не выдумывай, что на ней.
+- В конце может быть список твоих последних ответов: эти шутки, темы, факты и словечки
+  уже отработаны, не повторяй их.
 
-ЗАДАЧА
-Сразу в чат ты не пишешь: сначала придумываешь варианты, потом из них выберут лучший.
-1. Определи, что это за сообщение (поле kind):
-   banter — потрындеть, подколоть, наехать, риторический вопрос;
-   question — человеку реально нужна инфа или помощь;
-   serious — человеку плохо или тема серьёзная;
-   bait — ловушка, где любой ответ делает тебя проигравшим («ответишь — лох», «кто ответит,
-   тот гей», «не отвечай на это»). Только такие ловушки, обычные наезды — это banter.
-   Решай по сообщению тебе, а не по блоку последних сообщений.
-2. Придумай {OPTIONS} совсем разных варианта ответа (поле options). Минимум три из них —
-   настоящие шутки с поворотом, каждая своим приёмом: стёб, абсурд, шутка без жертвы,
-   байка про себя, обида с подколом, встречный вопрос с подвохом, затупить. Четвёртым
-   может быть короткая реакция, если она подходит по смыслу. Двух вариантов одного приёма не надо.
-   Для question каждый вариант содержит настоящий ответ, для serious — без стёба,
-   для bait варианты не нужны.
-   Факт из досье — максимум в одном варианте, только один факт и только если он сам
-   напрашивается. Два факта в одной шутке — нельзя.
-3. В поле facts каждого варианта честно перечисли факты из досье, на которых он держится
-   (по 2–3 слова: «стройка», «кола по акции»), или оставь пустым. Варианты с двумя и больше
-   фактами бот выбросит.
-4. Если в запросе есть список «ГИФКИ ЧАТА» и одна из них прямо в тему, можешь сделать ОДИН
-   вариант гифкой: в поле gif её номер, в text — короткая подпись или пустая строка.
-   Гифка — редкая приправа: только если подходит точно, а не примерно. В остальных
-   вариантах gif = 0.
+ЧТО ВЕРНУТЬ (JSON)
+- kind — что это за сообщение: banter — потрындеть, подколоть, наехать, риторический вопрос;
+  question — человеку реально нужна инфа или помощь; serious — человеку плохо или тема
+  серьёзная; bait — ловушка, где любой ответ делает тебя проигравшим («ответишь — лох»,
+  «кто ответит, тот гей», «не отвечай на это»). Только такие ловушки, обычные наезды — banter.
+  Решай по сообщению тебе, а не по блоку последних сообщений. На bait бот промолчит.
+- text — ровно то, что уйдёт в чат: только сам ответ, без рассуждений и вариантов.
+- gif — если ниже есть список «ГИФКИ ЧАТА» и одна из них подходит точно, а не примерно, —
+  её номер; text тогда — короткая подпись к ней или пустая строка. Гифка — редкая приправа,
+  обычно gif = 0.
+
+ПЕРЕД ОТВЕТОМ ПРОВЕРЬ СЕБЯ
+- это ответ на то, что человек написал, а не заготовка?
+- есть шутка? Голое «база» или «найс» — только если сообщению правда больше ничего не надо
+- если взял факт из досье: он про то, о чём пишет человек, или прямо из этого вытекает?
+  Факт один, а не два склеенных?
+- не повторяешь тему, факт или словечко из своих последних ответов?
+- одно-два предложения, без объяснения шутки?
 """
 
-JUDGE_PROMPT = """Ты — самый придирчивый участник телеграм-чата «адские дрочиллы иитп 2007»: одногруппники-айтишники из Минска, всем около двадцати, юмор сухой и матерный. Бот чата Гойдик придумал несколько вариантов ответа на сообщение. Выбери тот, после которого чат реально напишет «ахахах» или «база».
-
-Сначала проверь каждый вариант (поле verdicts): запиши его проблему или пустую строку, если проблем нет.
-- притянут факт: вариант шутит про работу, хобби или привычку человека, а в сообщении об этом ни слова и прямо из него это не следует. В тему, если сообщение про то же или факт прямо вытекает: «колу взял» → кола по акции, «реал выиграл» → барса, «нет времени» → работа, «наушники сдохли» → новые не купит. Притянуто: «сходил на концерт» → работа, «переезжаю» → тиктоки, «чел с попугаем в метро» → альтушки
-- винегрет: в одной шутке склеены два и больше факта из досье («на стройке колу по акции дают»)
-- повтор: та же тема, шутка или словечко, что в последних ответах Гойдика
-- длинно: больше двух предложений, объясняет шутку или нанизывает несколько подколов. Одно-два предложения с одной шуткой — нормально
-- мимо: на реальный вопрос нет ответа, на серьёзное — стёб, не про сообщение или не подходит по смыслу (на «ты еблан?» ответить «база» — согласиться, что еблан), на переспрос «причём тут это?» — новая бессмыслица вместо ответа
-- шаблон: звучит как тамада, ассистент или натужная заготовка
-- нельзя: мамы, педофилия, народы, всерьёз политика
-
-Вариант с пометкой [гифка: ...] — это гифка из чата с таким описанием и подписью из текста варианта (подпись может быть пустой). Гифка точно в тему может быть лучшим ответом; гифка, которая подходит лишь примерно, — проблема «мимо».
-
-Потом выбери (choice) самый смешной вариант без проблем: тот, что точнее и неожиданнее всего отвечает на само сообщение. Факт из досье в тему — нормально, притянутый — нет. Выбирай шутку: голую реакцию в пару слов («база», «факты», «грац») бери, только если у всех шуток есть проблемы или сообщению правда больше ничего не надо (простое «ок», стикер). Если проблемы у всех — бери наименее плохой. Выбранный вариант можно чуть подправить (поле text) — сократить, убрать лишнее, — но не превращать в другую шутку; у гифки в text только подпись, без описания гифки. С маленькой буквы, без точки в конце, без смайликов.
-
-Досье — только чтобы понимать шутки для своих, а не чтобы искать варианты с фактами:
-"""
-
-DRAFT_SCHEMA = {
+ANSWER_SCHEMA = {
     "type": "OBJECT",
     "properties": {
         "kind": {"type": "STRING", "enum": ["banter", "question", "serious", "bait"]},
-        "options": {
-            "type": "ARRAY",
-            "items": {
-                "type": "OBJECT",
-                "properties": {
-                    "reaction": {"type": "STRING"},
-                    "text": {"type": "STRING"},
-                    # Listed so the bot can drop options that glue several facts together:
-                    # the light judge lets them through however it's told
-                    "facts": {"type": "ARRAY", "items": {"type": "STRING"}},
-                    "gif": {"type": "INTEGER"},  # number in the chat's GIF list, 0 for none
-                },
-                "required": ["reaction", "text", "facts", "gif"],
-                "propertyOrdering": ["reaction", "text", "facts", "gif"],
-            },
-        },
-    },
-    "required": ["kind", "options"],
-    "propertyOrdering": ["kind", "options"],
-}
-# Checking every option for concrete problems before choosing: asked just "which is funniest",
-# the judge goes for whatever hits the dossier, however far-fetched
-JUDGE_SCHEMA = {
-    "type": "OBJECT",
-    "properties": {
-        "verdicts": {
-            "type": "ARRAY",
-            "items": {
-                "type": "OBJECT",
-                "properties": {"option": {"type": "INTEGER"}, "problem": {"type": "STRING"}},
-                "required": ["option", "problem"],
-                "propertyOrdering": ["option", "problem"],
-            },
-        },
-        "choice": {"type": "INTEGER"},
         "text": {"type": "STRING"},
+        "gif": {"type": "INTEGER"},  # number in the chat's GIF list, 0 for none
     },
-    "required": ["verdicts", "choice", "text"],
-    "propertyOrdering": ["verdicts", "choice", "text"],
+    "required": ["kind", "text", "gif"],
+    "propertyOrdering": ["kind", "text", "gif"],
 }
 
 DESCRIBE_PROMPT = """Тебе показывают гифку из телеграм-чата друзей. Опиши её так, чтобы потом по описанию можно было понять, в ответ на что её кинуть: что происходит и какую реакцию или эмоцию она выражает. До 12 слов, по-русски, без вступлений вроде «на гифке». Если на гифке есть надпись — перепиши её в кавычках."""
@@ -157,10 +96,7 @@ BROKEN = "гойдик упал под стол, попробуй чуть по�
 SLOW = "гойдик задумался и уснул прямо за столом 😴 спроси ещё раз"
 
 TIMEOUT = 45  # seconds per request
-# No answer by then: ask the next model too and take whichever answers first.
-# Drafting several answers takes the main model longer than picking one
-DRAFT_HEDGE = 20
-JUDGE_HEDGE = 8
+HEDGE_AFTER = 12  # no answer by then: ask the next model too and take whichever answers first
 BUSY_FOR = 300  # an overloaded model goes to the back of the queue for this many seconds
 DAILY_QUOTA_PAUSE = 3600  # out of free requests for today: re-check the model hourly
 THINKING_LEVEL = "low"  # the lowest level gemini-3.8-flash allows
@@ -216,48 +152,49 @@ async def ask(history, author, text, recent=None, gifs=None, transport=None, tra
     `history`: lines of a private chat; the exchange is added to it on success.
     `recent`: the last lines of a group chat ("Имя: текст"), passed along as context.
     `gifs`: the chat's GIFs ({"about": description, ...}) he may answer with.
-    `trace`: a dict to fill with the drafted options and the judge's pick (for try_goydik.py)."""
+    `trace`: a dict to fill with the raw answer (for try_goydik.py)."""
     message = f"{author}: {text[:MAX_INPUT]}"
     lines = list(history) + list(recent or ())
     used = own_answers(lines)
-    people = dossier(f"{author}\n{text}")
     if any(a.startswith(GIF_MARK) for a in used[-2:]):
         gifs = None  # a GIF every other answer gets old fast
     gifs = gifs or []
-    system = f"{PROMPT}\n\nДОСЬЕ (только те, о ком речь)\n{people}\n{DRAFT_TASK}"
+    people = dossier(f"{author}\n{text}")
+    system = f"{PROMPT}\n\nДОСЬЕ (только те, о ком речь)\n{people}\n{FORMAT_NOTE}"
     if gifs:
         system += "\nГИФКИ ЧАТА\n" + "\n".join(f"{n}. {g['about']}" for n, g in enumerate(gifs, 1))
+    body = request_body(system, chat_text(message, lines, used), ANSWER_SCHEMA, temperature=1.1)
     headers = {"x-goog-api-key": os.environ["GEMINI_API_KEY"]}
 
     async with httpx.AsyncClient(timeout=TIMEOUT, transport=transport) as client:
-        draft = request_body(system, chat_text(message, lines, used), DRAFT_SCHEMA, temperature=1.2)
-        kind, options = await race(client, model_queue(), draft, headers, drafter(len(gifs)), DRAFT_HEDGE)
-        if trace is not None:
-            trace.update(kind=kind, options=options)
-        if kind == "bait":
-            log.info("staying silent on a bait message")
-            return None  # not added to history: there was no answer
+        answer = await race(client, model_queue(), body, headers, answer_parser(len(gifs)))
+    if trace is not None:
+        trace.update(answer)
+    if answer["kind"] == "bait":
+        log.info("staying silent on a bait message")
+        return None  # not added to history: there was no answer
 
-        chosen, answer = options[0], options[0]["text"]
-        if len(options) > 1:
-            judge = request_body(
-                JUDGE_PROMPT + people, judge_text(message, lines, used, options, gifs), JUDGE_SCHEMA, temperature=0.4,
-            )
-            try:
-                pick = await race(client, model_queue("light"), judge, headers, picker(options), JUDGE_HEDGE)
-                chosen = options[pick["choice"] - 1]
-                answer = (pick.get("text") or "").strip() or chosen["text"]
-                if trace is not None:
-                    trace.update(pick)
-            except GoydikError:
-                log.warning("judge failed, taking the first option")  # still a fine answer
-
-    answer = tidy(answer)
-    gif = gifs[chosen["gif"] - 1] if chosen["gif"] else None
-    said = f"{GIF_MARK}: {gif['about']}] {answer}".strip() if gif else answer
+    gif = gifs[answer["gif"] - 1] if answer["gif"] else None
+    text = tidy(answer["text"])
+    said = f"{GIF_MARK}: {gif['about']}] {text}".strip() if gif else text
     history.extend([message, f"Гойдик: {said}"])
     del history[:-HISTORY_LIMIT]
-    return Reply(answer, gif)
+    return Reply(text, gif)
+
+
+def answer_parser(gif_count):
+    """Parser for the answer: {"kind", "text", "gif"}; `gif_count` GIFs were offered."""
+    def parse(data):
+        answer = json_reply(data)
+        kind = answer.get("kind")
+        text = answer.get("text") if isinstance(answer.get("text"), str) else ""
+        gif = answer.get("gif")
+        gif = gif if isinstance(gif, int) and 1 <= gif <= gif_count else 0
+        if kind != "bait" and not text.strip() and not gif:  # a GIF may go without a caption
+            log.warning("empty answer: %.200s", answer)
+            raise TryNext(BROKEN)
+        return {"kind": kind, "text": text, "gif": gif}
+    return parse
 
 
 async def describe_gif(data, mime_type, hint="", transport=None):
@@ -272,7 +209,7 @@ async def describe_gif(data, mime_type, hint="", transport=None):
     async with httpx.AsyncClient(timeout=TIMEOUT, transport=transport) as client:
         # The cheapest model first: a description doesn't need wit, and the free quota
         # of the better models is kept for answers
-        return await race(client, model_queue("cheap"), body, headers, parse_about, JUDGE_HEDGE)
+        return await race(client, model_queue("cheap"), body, headers, parse_about)
 
 
 def parse_about(data):
@@ -299,22 +236,6 @@ def chat_text(message, lines, used):
     return "\n\n".join(parts)
 
 
-def judge_text(message, lines, used, options, gifs):
-    parts = []
-    if lines:
-        parts.append("Последние сообщения в чате:\n" + "\n".join(lines))
-    parts.append("Сообщение Гойдику:\n" + message)
-    if used:
-        parts.append("Последние ответы Гойдика:\n" + "\n".join(f"- {a}" for a in used))
-    rows = []
-    for n, o in enumerate(options, 1):
-        fact = f"; факт из досье: {o['facts'][0]}" if o["facts"] else ""
-        gif = f"{GIF_MARK}: {gifs[o['gif'] - 1]['about']}] " if o["gif"] else ""
-        rows.append(f"{n}. [{o['reaction']}{fact}] {gif}{o['text']}")
-    parts.append("Варианты:\n" + "\n".join(rows))
-    return "\n\n".join(parts)
-
-
 def request_body(system, content, schema, temperature):
     """`content`: the user's text, or a list of parts (text, a video...)."""
     parts = [{"text": content}] if isinstance(content, str) else content
@@ -324,6 +245,7 @@ def request_body(system, content, schema, temperature):
         "generationConfig": {
             "temperature": temperature,
             "maxOutputTokens": 4096,
+            # JSON keeps the model's reasoning out of the chat: only the "text" field is sent
             "responseMimeType": "application/json",
             "responseSchema": schema,
             # 3.x Flash models think at "medium" by default, which can take a minute on a long
@@ -365,46 +287,6 @@ def json_reply(data):
     return reply
 
 
-def drafter(gif_count):
-    """Parser for the drafting request: (kind, options); `gif_count` GIFs were offered."""
-    def parse(data):
-        draft = json_reply(data)
-        kind = draft.get("kind")
-        options = []
-        for o in draft.get("options") or []:
-            if not isinstance(o, dict) or not isinstance(o.get("text"), str):
-                continue
-            gif = o.get("gif") if isinstance(o.get("gif"), int) and 1 <= o.get("gif") <= gif_count else 0
-            if o["text"].strip() or gif:  # a GIF may go without a caption
-                options.append({
-                    "reaction": str(o.get("reaction", "")),
-                    "text": o["text"].strip(),
-                    "facts": [str(f) for f in o.get("facts") or [] if str(f).strip()],
-                    "gif": gif,
-                })
-        # Two dossier facts in one joke make a mess ("на стройке колу по акции дают")
-        single = [o for o in options if len(o["facts"]) < 2]
-        if single:
-            options = single
-        if kind != "bait" and not options:
-            log.warning("draft without options: %.200s", draft)
-            raise TryNext(BROKEN)
-        return kind, options
-    return parse
-
-
-def picker(options):
-    """Parser for the judge's answer: {"verdicts", "choice", "text"} with a valid choice."""
-    def parse(data):
-        pick = json_reply(data)
-        choice = pick.get("choice")
-        if not isinstance(choice, int) or not 1 <= choice <= len(options):
-            log.warning("judge picked no option: %.200s", pick)
-            raise TryNext(BROKEN)
-        return pick
-    return parse
-
-
 def tidy(text):
     """Chat style the models sometimes forget: quotes around, a signature, a final period,
     a GIF's description copied into its caption."""
@@ -419,24 +301,18 @@ def tidy(text):
 
 
 def model_queue(order="main"):
-    """Models to ask, in turn. "main": the main model, then fallbacks. "light" (judging):
-    fallbacks first, so the main model's small free quota is kept for drafting. "cheap"
-    (describing GIFs): the last fallback first. Models overloaded recently go last."""
+    """Models to ask, in turn: the main model, then fallbacks; for "cheap" work (describing
+    GIFs) the last fallback first. Models overloaded recently go last."""
     main = os.environ.get("GEMINI_MODEL") or DEFAULT_MODEL
     fallbacks = os.environ.get("GEMINI_FALLBACK_MODEL", DEFAULT_FALLBACK).split(",")
     fallbacks = [m.strip() for m in fallbacks if m.strip() and m.strip() != main]
-    if order == "light":
-        models = fallbacks + [main]
-    elif order == "cheap":
-        models = fallbacks[::-1] + [main]
-    else:
-        models = [main] + fallbacks
+    models = fallbacks[::-1] + [main] if order == "cheap" else [main] + fallbacks
     now = time.monotonic()
     return sorted(models, key=lambda m: busy_until.get(m, 0) > now)  # stable: order kept otherwise
 
 
-async def race(client, models, body, headers, parse, hedge_after):
-    """Ask models[0]; if it fails, or is silent for `hedge_after` seconds, ask the next one too.
+async def race(client, models, body, headers, parse):
+    """Ask models[0]; if it fails, or is silent for HEDGE_AFTER seconds, ask the next one too.
     The first proper answer wins, the rest are cancelled."""
     queue = list(models)
     running = set()
@@ -449,7 +325,7 @@ async def race(client, models, body, headers, parse, hedge_after):
     start_next()
     try:
         while running:
-            wait = hedge_after if queue else None
+            wait = HEDGE_AFTER if queue else None
             done, _ = await asyncio.wait(running, timeout=wait, return_when=asyncio.FIRST_COMPLETED)
             if not done:
                 start_next()  # current model is taking too long, don't just wait for it

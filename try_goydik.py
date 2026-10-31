@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Ask Гойдик test messages through the real Gemini API and print his drafted options,
-the judge's pick and the final answer, to check prompt.txt / people.txt edits before deploying.
+"""Ask Гойдик test messages through the real Gemini API and print his answers,
+to check prompt.txt / people.txt edits before deploying.
 
     python -X utf8 try_goydik.py            single messages, then the group dialog
     python -X utf8 try_goydik.py 3 7        only cases 3 and 7
@@ -57,7 +57,7 @@ CASES = [
     ("Лёша", "второй день без кофе"),
     ("Максим", "прикиньте, в метро сегодня чел с попугаем на плече ехал"),
 ]
-PAUSE = 8  # seconds between messages (two requests each): the free tier allows only a few per minute
+PAUSE = 5  # seconds between messages: the free tier allows only a few requests per minute
 
 # Stand-ins for the chat's GIF collection: descriptions like the ones Gemini writes
 GIFS = [{"id": f"test{n}", "about": about} for n, about in enumerate([
@@ -83,19 +83,14 @@ DIALOG = [
 
 
 async def answer(who, text, recent, indent):
-    """Ask Гойдик and print the drafted options, the judge's pick and the final answer."""
+    """Ask Гойдик and print his answer (and the kind of message, if it isn't banter)."""
     trace = {}
     try:
         reply = await goydik.ask([], PEOPLE[who], text, recent=recent, gifs=GIFS, trace=trace)
     except goydik.GoydikError as e:
         reply = goydik.Reply(f"(ошибка: {e})")
-    problems = {v.get("option"): v.get("problem") for v in trace.get("verdicts", []) if isinstance(v, dict)}
-    for n, option in enumerate(trace.get("options", []), 1):
-        mark = "→" if n == trace.get("choice") else " "
-        problem = f"   ✗ {problems[n]}" if problems.get(n) else ""
-        facts = f" ({', '.join(option['facts'])})" if option.get("facts") else ""
-        gif = f" [гифка: {GIFS[option['gif'] - 1]['about']}]" if option.get("gif") else ""
-        print(f"{indent}  {mark} {n}. [{option['reaction']}]{facts}{gif} {option['text']}{problem}")
+    if trace.get("kind") and trace["kind"] != "banter":
+        print(f"{indent}  ({trace['kind']})")
     if reply is None:
         said = "(промолчал)"
     else:
