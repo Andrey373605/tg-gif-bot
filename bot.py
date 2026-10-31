@@ -338,11 +338,13 @@ async def keep_typing(bot, chat_id):
         await asyncio.sleep(4)
 
 
-async def talk(msg, text, context):
+async def talk(msg, text, context, author=None, note=None):
+    """Answer `msg` with Гойдик. `author` and `text`: the message he answers, by default the
+    sender's; `note`: why he's answering it, see called_on()."""
     if not goydik.enabled():
         await msg.reply_text(GOYDIK_ASLEEP)
         return
-    author = display_name(msg.from_user)
+    author = author or display_name(msg.from_user)
     in_group = msg.chat.type != Chat.PRIVATE
     if in_group:
         # The group log already has earlier questions and Гойдик's answers
@@ -354,7 +356,7 @@ async def talk(msg, text, context):
     ok = False
     try:
         gifs = fresh_gifs(msg.chat_id, [text] + recent) if in_group else None
-        reply = await goydik.ask(history, author, text, recent=recent, gifs=gifs)
+        reply = await goydik.ask(history, author, text, recent=recent, gifs=gifs, note=note)
         ok = True
     except goydik.GoydikError as e:
         reply = goydik.Reply(str(e))
@@ -398,28 +400,30 @@ async def send_gif(msg, reply):
 CALLED_EMPTY = "(тебя просто позвали, ничего не написав)"
 
 
-def with_reply(text, replied, username, gif=None):
-    """Add the message Гойдик was called on, so he knows what people are talking about.
-    `gif`: the description of the GIF in that message, if there is one."""
-    if not replied or not replied.from_user:
-        return text
-    if replied.from_user.username == username:
-        return text  # reply to Гойдик himself: it's already in the history
-    who = display_name(replied.from_user)
+def called_on(msg, text, username, gif=None):
+    """(author, text, note) for Гойдик. Tagged in a reply to someone else's message, he's
+    asked about that message, so it becomes the message to him and whoever called him goes
+    into the note. Given as the caller's words with a quote, it lost to the caller's dossier,
+    and he roasted the caller. `gif`: what's on the GIF in the replied message."""
+    caller = display_name(msg.from_user)
+    replied = msg.reply_to_message
+    if not replied or not replied.from_user or replied.from_user.username == username:
+        return caller, text, None  # reply to Гойдик himself: it's already in the history
+    quoted = replied.text or replied.caption or ""
     if gif:
-        caption = f" с подписью «{replied.caption}»" if replied.caption else ""
-        seen = f"{who} кинул гифку{caption}: {gif}"
-        return f"{text}\n(это в ответ на то, что {seen})" if text else f"чё скажешь: {seen}"
-    quoted = replied.text or replied.caption
-    if quoted:
-        if not text:
-            return f"чё скажешь про это сообщение от {who}: «{quoted}»"
-        return f"{text}\n(это в ответ на сообщение от {who}: «{quoted}»)"
-    if replied.photo or replied.video or replied.animation or replied.sticker or replied.video_note:
-        # Гойдик only reads text
-        seen = f"{who} показывает тебе картинку или видео, но ты его не видишь, глаза не фокусируются"
-        return f"{text}\n({seen})" if text else f"({seen})"
-    return text
+        quoted = f"[гифка: {gif}] {quoted}".strip()
+    if not quoted:
+        if replied.photo or replied.video or replied.animation or replied.sticker or replied.video_note:
+            # Гойдик only reads text
+            who = display_name(replied.from_user)
+            seen = f"{who} показывает тебе картинку или видео, но ты его не видишь, глаза не фокусируются"
+            return caller, f"{text}\n({seen})" if text else f"({seen})", None
+        return caller, text, None
+    added = f" со словами «{text}»" if text else ""
+    # Naming whom to answer matters: "answer this message" alone, he still went for the caller
+    target = replied.from_user.first_name or replied.from_user.full_name
+    note = f"тебя позвал {caller}{added}; отвечай на это сообщение его автору ({target}), позвавшего не трогай"
+    return display_name(replied.from_user), quoted, note
 
 
 def mentions_bot(msg, username):
@@ -439,11 +443,11 @@ def strip_mention(text, username):
 async def goydik_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     gif = await replied_gif(context.bot, msg)
-    text = with_reply(command_text(msg), msg.reply_to_message, context.bot.username, gif)
+    author, text, note = called_on(msg, command_text(msg), context.bot.username, gif)
     if not text:
         await msg.reply_text(GOYDIK_USAGE)
         return
-    await talk(msg, text, context)
+    await talk(msg, text, context, author, note)
 
 
 def replies_to_goydik(msg, username):
@@ -468,11 +472,11 @@ async def group_goydik(update: Update, context: ContextTypes.DEFAULT_TYPE):
         about = await gif_about(context.bot, msg.chat_id, msg.animation, msg.caption)
         mark = f"[гифка: {about}]" if about else "[гифка]"
         text = f"{mark} {text}".strip()
-    text = with_reply(text, msg.reply_to_message, username, await replied_gif(context.bot, msg))
+    author, text, note = called_on(msg, text, username, await replied_gif(context.bot, msg))
     # A reply with just a sticker or photo: tell Гойдик what it was
     text = text or describe_message(msg, username)
     # Just "@bot" with nothing else: Гойдик reacts to being called
-    await talk(msg, text or CALLED_EMPTY, context)
+    await talk(msg, text or CALLED_EMPTY, context, author, note)
 
 
 async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):

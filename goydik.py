@@ -52,6 +52,9 @@ FORMAT_NOTE = """
   «[фото]», «[стикер 😂]» — что скинули; картинки и видео ты не видишь, а «[гифка: ...]» —
   гифка с описанием того, что на ней: реагируй на неё как на увиденную. Голая «[гифка]» —
   описать не вышло: отреагируй на сам факт гифки, не выдумывай, что на ней.
+- «(тебя позвал Вася ...; отвечай на это сообщение его автору ...)» — Вася показал тебе
+  чужое сообщение: отвечай на само сообщение и его автору. Если Вася показывает, что про
+  тебя пишут, — огрызайся на того, кто писал. Подкалывать Васю вместо ответа — мимо.
 - В конце может быть список твоих последних ответов: эти шутки, темы, факты и словечки
   уже отработаны, не повторяй их.
 
@@ -147,13 +150,17 @@ def dossier(text):
     return "\n\n".join(found) or "(ни о ком из досье тут речи нет)"
 
 
-async def ask(history, author, text, recent=None, gifs=None, transport=None, trace=None):
+async def ask(history, author, text, recent=None, gifs=None, note=None, transport=None, trace=None):
     """Гойдик's Reply to `author: text`, or None when he stays silent (a bait message).
     `history`: lines of a private chat; the exchange is added to it on success.
     `recent`: the last lines of a group chat ("Имя: текст"), passed along as context.
     `gifs`: the chat's GIFs ({"about": description, ...}) he may answer with.
+    `note`: who asked him to answer this message; the people named there get no dossier,
+    so he answers the message instead of roasting them.
     `trace`: a dict to fill with the raw answer (for try_goydik.py)."""
     message = f"{author}: {text[:MAX_INPUT]}"
+    if note:
+        message += f"\n({note})"
     lines = list(history) + list(recent or ())
     used = own_answers(lines)
     if any(a.startswith(GIF_MARK) for a in used[-2:]):
@@ -207,8 +214,8 @@ async def describe_gif(data, mime_type, hint="", transport=None):
     body = request_body(DESCRIBE_PROMPT, content, DESCRIBE_SCHEMA, temperature=0.2)
     headers = {"x-goog-api-key": os.environ["GEMINI_API_KEY"]}
     async with httpx.AsyncClient(timeout=TIMEOUT, transport=transport) as client:
-        # The cheapest model first: a description doesn't need wit, and the free quota
-        # of the better models is kept for answers
+        # Only the cheapest model: a description doesn't need wit, it has the most free
+        # requests a day, and the better models' small quota is kept for answers
         return await race(client, model_queue("cheap"), body, headers, parse_about)
 
 
@@ -302,11 +309,11 @@ def tidy(text):
 
 def model_queue(order="main"):
     """Models to ask, in turn: the main model, then fallbacks; for "cheap" work (describing
-    GIFs) the last fallback first. Models overloaded recently go last."""
+    GIFs) only the last fallback. Models overloaded recently go last."""
     main = os.environ.get("GEMINI_MODEL") or DEFAULT_MODEL
     fallbacks = os.environ.get("GEMINI_FALLBACK_MODEL", DEFAULT_FALLBACK).split(",")
     fallbacks = [m.strip() for m in fallbacks if m.strip() and m.strip() != main]
-    models = fallbacks[::-1] + [main] if order == "cheap" else [main] + fallbacks
+    models = (fallbacks or [main])[-1:] if order == "cheap" else [main] + fallbacks
     now = time.monotonic()
     return sorted(models, key=lambda m: busy_until.get(m, 0) > now)  # stable: order kept otherwise
 
