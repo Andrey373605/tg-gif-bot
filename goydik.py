@@ -10,9 +10,9 @@ sees the dossier of the people a message is about, so he can't drag the others i
 Env:
     GEMINI_API_KEY          key from Google AI Studio (without it Гойдик is asleep)
     GEMINI_MODEL            model name, default gemini-3.8-flash
-    GEMINI_FALLBACK_MODEL   asked when the main model is overloaded or out of quota, and
-                            asked first for judging; default gemini-3.5-flash-lite,
-                            empty value turns it off
+    GEMINI_FALLBACK_MODEL   comma-separated models asked in turn when the main one is
+                            overloaded or out of quota; they also go first for judging.
+                            Default gemini-3.6-flash,gemini-3.5-flash-lite, empty turns them off
 """
 import asyncio
 import copy
@@ -29,7 +29,9 @@ log = logging.getLogger("goydik")
 
 API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 DEFAULT_MODEL = "gemini-3.8-flash"
-DEFAULT_FALLBACK = "gemini-3.5-flash-lite"
+# 3.6 Flash writes Russian nearly as well as 3.8 and has its own free quota;
+# Flash-Lite is the last resort
+DEFAULT_FALLBACK = "gemini-3.6-flash,gemini-3.5-flash-lite"
 # Overloaded (503), internal error (500) or this model's free quota is over (429):
 # another model may still answer
 RETRY_STATUSES = {429, 500, 503}
@@ -360,14 +362,13 @@ def tidy(text):
 
 
 def model_queue(light_first=False):
-    """Main model, then fallback (the other way round for light work like judging);
-    models that were overloaded recently go last."""
-    models = [os.environ.get("GEMINI_MODEL") or DEFAULT_MODEL]
-    fallback = os.environ.get("GEMINI_FALLBACK_MODEL", DEFAULT_FALLBACK)
-    if fallback and fallback not in models:
-        models.append(fallback)
-    if light_first:
-        models.reverse()
+    """Main model, then fallbacks in order; for light work like judging the fallbacks go
+    first, so the main model's small free quota is kept for drafting. Models that were
+    overloaded recently go last."""
+    main = os.environ.get("GEMINI_MODEL") or DEFAULT_MODEL
+    fallbacks = os.environ.get("GEMINI_FALLBACK_MODEL", DEFAULT_FALLBACK).split(",")
+    fallbacks = [m.strip() for m in fallbacks if m.strip() and m.strip() != main]
+    models = fallbacks + [main] if light_first else [main] + fallbacks
     now = time.monotonic()
     return sorted(models, key=lambda m: busy_until.get(m, 0) > now)  # stable: order kept otherwise
 
