@@ -247,6 +247,8 @@ def forget(chat_data, message_id):
 def describe_message(msg, username):
     """One line of text for the context log: text, caption and a mark for media."""
     parts = [mark for attr, mark in MEDIA_MARKS if getattr(msg, attr)]
+    if msg.animation and "[файл]" in parts:
+        parts.remove("[файл]")  # Telegram sets a GIF's document too
     if msg.sticker:
         parts.append(f"[стикер {msg.sticker.emoji or ''}]".replace(" ]", "]"))
     text = strip_mention(msg.text or msg.caption, username)
@@ -278,15 +280,10 @@ async def record_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
 async def learn_gif(bot, chat_data, msg):
     """Remember a GIF sent to the group, with Gemini's description of what's on it: Гойдик
     can send it back later, and the chat log shows «[гифка: ...]» instead of a bare «[гифка]»."""
-    about = await gif_about(bot, msg.chat_id, msg.animation, msg.caption)
-    if not about:
-        return
-    for entry in chat_data.get("recent", ()):
-        if entry["id"] == msg.message_id:
-            entry["text"] = entry["text"].replace("[гифка]", f"[гифка: {about}]", 1)
+    await media_mark(bot, chat_data, msg)
 
 
-GIF_TIMEOUT = 30  # seconds for Telegram to hand over a GIF: the default 5 is often too little
+FILE_TIMEOUT = 30  # seconds for Telegram to hand over a file: the default 5 is often too little
 
 
 async def gif_about(bot, chat_id, anim, caption=None):
@@ -305,8 +302,8 @@ async def gif_about(bot, chat_id, anim, caption=None):
             return gif["about"]
         hint = " ".join(filter(None, [caption, anim.file_name]))
         try:
-            tg_file = await bot.get_file(anim.file_id, read_timeout=GIF_TIMEOUT)
-            data = await tg_file.download_as_bytearray(read_timeout=GIF_TIMEOUT)
+            tg_file = await bot.get_file(anim.file_id, read_timeout=FILE_TIMEOUT)
+            data = await tg_file.download_as_bytearray(read_timeout=FILE_TIMEOUT)
             about = await goydik.describe_gif(bytes(data), anim.mime_type or "video/mp4", hint)
         except Exception:
             log.warning("couldn't describe a GIF", exc_info=True)
@@ -316,12 +313,48 @@ async def gif_about(bot, chat_id, anim, caption=None):
     return about
 
 
-async def replied_gif(bot, msg):
-    """Description of the GIF `msg` replies to, if it does."""
-    replied = msg.reply_to_message
-    if replied and replied.animation:
-        return await gif_about(bot, msg.chat_id, replied.animation, replied.caption)
-    return None
+PHOTO_MAX_SIDE = 1280  # a bigger size only takes longer to download and describe
+PHOTO_CACHE = {}  # file_unique_id -> description, so a picture tagged twice is described once
+PHOTO_CACHE_SIZE = 300
+
+
+async def photo_about(bot, sizes, caption=None):
+    """What's on a picture (`sizes`: its PhotoSize list); None if it couldn't be described.
+    Only pictures Гойдик is called on get here, not every photo in the group."""
+    photo = ([p for p in sizes if max(p.width, p.height) <= PHOTO_MAX_SIDE] or sizes[:1])[-1]
+    if photo.file_unique_id in PHOTO_CACHE:
+        return PHOTO_CACHE[photo.file_unique_id]
+    if not goydik.enabled():
+        return None
+    try:
+        tg_file = await bot.get_file(photo.file_id, read_timeout=FILE_TIMEOUT)
+        data = await tg_file.download_as_bytearray(read_timeout=FILE_TIMEOUT)
+        about = await goydik.describe_photo(bytes(data), "image/jpeg", caption or "")
+    except Exception:
+        log.warning("couldn't describe a picture", exc_info=True)
+        return None
+    PHOTO_CACHE[photo.file_unique_id] = about
+    while len(PHOTO_CACHE) > PHOTO_CACHE_SIZE:
+        del PHOTO_CACHE[next(iter(PHOTO_CACHE))]  # the oldest one
+    return about
+
+
+async def media_mark(bot, chat_data, msg):
+    """«[гифка: ...]» or «[фото: ...]» for the GIF or picture in `msg`, saying what's on it;
+    the bare mark if it couldn't be described, None if there's neither. The description also
+    goes into the group log, so Гойдик still knows what was there a few messages later."""
+    if msg.animation:
+        kind, about = "гифка", await gif_about(bot, msg.chat_id, msg.animation, msg.caption)
+    elif msg.photo:
+        kind, about = "фото", await photo_about(bot, msg.photo, msg.caption)
+    else:
+        return None
+    if not about:
+        return f"[{kind}]"
+    for entry in chat_data.get("recent", ()):
+        if entry["id"] == msg.message_id:
+            entry["text"] = entry["text"].replace(f"[{kind}]", f"[{kind}: {about}]", 1)
+    return f"[{kind}: {about}]"
 
 
 def recent_lines(chat_data, exclude_id):
@@ -355,8 +388,10 @@ async def talk(msg, text, context, author=None, note=None):
     typing = asyncio.create_task(keep_typing(context.bot, msg.chat_id))
     ok = False
     try:
-        gifs = fresh_gifs(msg.chat_id, [text] + recent) if in_group else None
-        reply = await goydik.ask(history, author, text, recent=recent, gifs=gifs, note=note)
+        gifs = fresh_gifs(msg.chat_id, text, recent) if in_group else None
+        # "кинь гифку": the caller's own words, not the «[гифка: ...]» marks in `text`
+        want_gif = bool(GIF_REQUEST.search(msg.text or msg.caption or ""))
+        reply = await goydik.ask(history, author, text, recent=recent, gifs=gifs, note=note, want_gif=want_gif)
         ok = True
     except goydik.GoydikError as e:
         reply = goydik.Reply(str(e))
@@ -381,10 +416,16 @@ async def talk(msg, text, context, author=None, note=None):
         remember(context.chat_data, sent.message_id, "Гойдик", said)
 
 
-def fresh_gifs(chat_id, lines):
+GIF_REQUEST = re.compile(r"гиф|gif", re.I)
+FRESH_LINES = 5  # GIFs posted in the last few messages aren't sent back
+
+
+def fresh_gifs(chat_id, text, recent):
     """The group's GIFs Гойдик may answer with (they're collected in groups only), minus the
-    ones in `lines`: a GIF sent to him would fit his answer best, and he'd just send it back."""
-    seen = "\n".join(lines)
+    ones just posted: a GIF sent to him would fit his answer best, and he'd send it right
+    back. Only the last few messages and his own answers count: the whole log is 30 messages,
+    and while the collection is young that's every GIF it has."""
+    seen = "\n".join([text] + recent[-FRESH_LINES:] + [line for line in recent if line.startswith("Гойдик:")])
     return [g for g in GIFS.choices(chat_id) if f"[гифка: {g['about']}]" not in seen]
 
 
@@ -400,24 +441,20 @@ async def send_gif(msg, reply):
 CALLED_EMPTY = "(тебя просто позвали, ничего не написав)"
 
 
-def called_on(msg, text, username, gif=None):
+def called_on(msg, text, username, mark=None):
     """(author, text, note) for Гойдик. Tagged in a reply to someone else's message, he's
     asked about that message, so it becomes the message to him and whoever called him goes
     into the note. Given as the caller's words with a quote, it lost to the caller's dossier,
-    and he roasted the caller. `gif`: what's on the GIF in the replied message."""
+    and he roasted the caller. `mark`: media_mark() of the replied message."""
     caller = display_name(msg.from_user)
     replied = msg.reply_to_message
     if not replied or not replied.from_user or replied.from_user.username == username:
         return caller, text, None  # reply to Гойдик himself: it's already in the history
-    quoted = replied.text or replied.caption or ""
-    if gif:
-        quoted = f"[гифка: {gif}] {quoted}".strip()
+    # Text with marks like «[видео]», «[стикер 😂]»; a described GIF or picture replaces its bare mark
+    quoted = describe_message(replied, username)
+    if mark:
+        quoted = re.sub(r"\[(?:фото|гифка)\]", lambda _: mark, quoted, count=1)
     if not quoted:
-        if replied.photo or replied.video or replied.animation or replied.sticker or replied.video_note:
-            # Гойдик only reads text
-            who = display_name(replied.from_user)
-            seen = f"{who} показывает тебе картинку или видео, но ты его не видишь, глаза не фокусируются"
-            return caller, f"{text}\n({seen})" if text else f"({seen})", None
         return caller, text, None
     added = f" со словами «{text}»" if text else ""
     # Naming whom to answer matters: "answer this message" alone, he still went for the caller
@@ -442,8 +479,9 @@ def strip_mention(text, username):
 
 async def goydik_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
-    gif = await replied_gif(context.bot, msg)
-    author, text, note = called_on(msg, command_text(msg), context.bot.username, gif)
+    replied = msg.reply_to_message
+    mark = await media_mark(context.bot, context.chat_data, replied) if replied else None
+    author, text, note = called_on(msg, command_text(msg), context.bot.username, mark)
     if not text:
         await msg.reply_text(GOYDIK_USAGE)
         return
@@ -467,12 +505,13 @@ async def group_goydik(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not (mentions_bot(msg, username) or replies_to_goydik(msg, username)):
         return  # someone else was tagged or answered
     text = strip_mention(msg.text or msg.caption, username)
-    if msg.animation:
-        # A GIF sent to Гойдик: tell him what's on it, or he says he can't see it
-        about = await gif_about(context.bot, msg.chat_id, msg.animation, msg.caption)
-        mark = f"[гифка: {about}]" if about else "[гифка]"
+    mark = await media_mark(context.bot, context.chat_data, msg)
+    if mark:
+        # A GIF or picture sent to Гойдик: tell him what's on it, or he says he can't see it
         text = f"{mark} {text}".strip()
-    author, text, note = called_on(msg, text, username, await replied_gif(context.bot, msg))
+    replied = msg.reply_to_message
+    replied_mark = await media_mark(context.bot, context.chat_data, replied) if replied else None
+    author, text, note = called_on(msg, text, username, replied_mark)
     # A reply with just a sticker or photo: tell Гойдик what it was
     text = text or describe_message(msg, username)
     # Just "@bot" with nothing else: Гойдик reacts to being called

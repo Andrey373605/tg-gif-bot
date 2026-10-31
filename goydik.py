@@ -50,9 +50,9 @@ FORMAT_NOTE = """
 - Сообщение тебе приходит в виде «Имя (@username): текст». Перед ним может быть блок
   последних сообщений: о чём болтали до тебя. Отвечай только на сообщение тебе.
 - «Гойдик: ...» — твои прошлые ответы. «Вася (@vasya) → Лена: ...» — Вася ответил Лене.
-  «[фото]», «[стикер 😂]» — что скинули; картинки и видео ты не видишь, а «[гифка: ...]» —
-  гифка с описанием того, что на ней: реагируй на неё как на увиденную. Голая «[гифка]» —
-  описать не вышло: отреагируй на сам факт гифки, не выдумывай, что на ней.
+  «[фото: ...]», «[гифка: ...]» — картинка или гифка с описанием того, что на ней: реагируй
+  как на увиденное. Голые «[фото]», «[гифка]», «[видео]», «[стикер 😂]» — что скинули, без
+  описания: отреагируй на сам факт, не выдумывай, что там, и не жалуйся, что не видишь.
 - «(тебя позвал Вася ...; отвечай на это сообщение его автору ...)» — Вася показал тебе
   чужое сообщение: отвечай на само сообщение и его автору. Если Вася показывает, что про
   тебя пишут, — огрызайся на того, кто писал. Подкалывать Васю вместо ответа — мимо.
@@ -68,7 +68,7 @@ FORMAT_NOTE = """
 - text — ровно то, что уйдёт в чат: только сам ответ, без рассуждений и вариантов.
 - gif — если ниже есть список «ГИФКИ ЧАТА» и одна из них подходит точно, а не примерно, —
   её номер; text тогда — короткая подпись к ней или пустая строка. Гифка — редкая приправа,
-  обычно gif = 0.
+  обычно gif = 0. Но если тебя просят кинуть гифку — кидай самую подходящую из списка.
 
 ПЕРЕД ОТВЕТОМ ПРОВЕРЬ СЕБЯ
 - это ответ на то, что человек написал, а не заготовка?
@@ -92,6 +92,7 @@ ANSWER_SCHEMA = {
 }
 
 DESCRIBE_PROMPT = """Тебе показывают гифку из телеграм-чата друзей. Опиши её так, чтобы потом по описанию можно было понять, в ответ на что её кинуть: что происходит и какую реакцию или эмоцию она выражает. До 12 слов, по-русски, без вступлений вроде «на гифке». Если на гифке есть надпись — перепиши её в кавычках."""
+PHOTO_PROMPT = """Тебе показывают картинку из телеграм-чата друзей. Коротко опиши, что на ней, так, чтобы друг без картинки понял, о чём речь и что ответить: что изображено и что происходит. Если это скриншот, мем или на картинке есть текст — перепиши главный текст в кавычках. До 30 слов, по-русски, без вступлений вроде «на картинке»."""
 DESCRIBE_SCHEMA = {"type": "OBJECT", "properties": {"about": {"type": "STRING"}}, "required": ["about"]}
 GIF_MARK = "[гифка"  # how a GIF looks in the chat log: «[гифка: кот падает со стола]»
 
@@ -164,27 +165,34 @@ def dossier(text):
     return "\n\n".join(found) or "(ни о ком из досье тут речи нет)"
 
 
-async def ask(history, author, text, recent=None, gifs=None, note=None, transport=None, trace=None):
+async def ask(history, author, text, recent=None, gifs=None, note=None, want_gif=False, transport=None, trace=None):
     """Гойдик's Reply to `author: text`, or None when he stays silent (a bait message).
     `history`: lines of a private chat; the exchange is added to it on success.
     `recent`: the last lines of a group chat ("Имя: текст"), passed along as context.
     `gifs`: the chat's GIFs ({"about": description, ...}) he may answer with.
     `note`: who asked him to answer this message; the people named there get no dossier,
     so he answers the message instead of roasting them.
+    `want_gif`: the message asks for a GIF, so he sends one if he has any.
     `trace`: a dict to fill with the raw answer (for try_goydik.py)."""
     message = f"{author}: {text[:MAX_INPUT]}"
     if note:
         message += f"\n({note})"
     lines = list(history) + list(recent or ())
     used = own_answers(lines)
-    if any(a.startswith(GIF_MARK) for a in used[-2:]):
-        gifs = None  # a GIF every other answer gets old fast
+    if not want_gif and any(a.startswith(GIF_MARK) for a in used[-2:]):
+        gifs = None  # a GIF every other answer gets old fast, unless someone asks for one
     gifs = gifs or []
     people = dossier(f"{author}\n{text}")
     system = f"{PROMPT}\n\nДОСЬЕ (только те, о ком речь)\n{people}\n{FORMAT_NOTE}"
     if gifs:
         system += "\nГИФКИ ЧАТА\n" + "\n".join(f"{n}. {g['about']}" for n, g in enumerate(gifs, 1))
     mood = random.choices([m for m, _ in MOODS], weights=[w for _, w in MOODS])[0]
+    if want_gif:
+        # Asked for "rare seasoning, only an exact fit", he kept answering a request with text
+        mood = ("тебя просят кинуть гифку: выбери из списка «ГИФКИ ЧАТА» самую подходящую "
+                "и поставь её номер в gif, text — короткая подпись или пусто" if gifs else
+                "тебя просят кинуть гифку, а гифок у тебя пока нет: скажи это по-своему — "
+                "ты кидаешь гифки, которые люди скидывают в этот чат")
     body = request_body(system, chat_text(message, lines, used, mood), ANSWER_SCHEMA, temperature=1.1)
     headers = {"x-goog-api-key": os.environ["GEMINI_API_KEY"]}
 
@@ -222,11 +230,20 @@ def answer_parser(gif_count):
 async def describe_gif(data, mime_type, hint="", transport=None):
     """A short description of a GIF (its video bytes) for picking it as a reaction later.
     `hint`: what's known besides the picture, like its caption or file name."""
+    return await describe(DESCRIBE_PROMPT, data, mime_type, hint, transport)
+
+
+async def describe_photo(data, mime_type="image/jpeg", hint="", transport=None):
+    """What's on a picture sent to Гойдик, text on it included (screenshots, memes)."""
+    return await describe(PHOTO_PROMPT, data, mime_type, hint, transport)
+
+
+async def describe(prompt, data, mime_type, hint, transport):
     content = [
         {"inline_data": {"mime_type": mime_type, "data": b64encode(data).decode()}},
         {"text": hint or "(без подписи)"},
     ]
-    body = request_body(DESCRIBE_PROMPT, content, DESCRIBE_SCHEMA, temperature=0.2)
+    body = request_body(prompt, content, DESCRIBE_SCHEMA, temperature=0.2)
     headers = {"x-goog-api-key": os.environ["GEMINI_API_KEY"]}
     async with httpx.AsyncClient(timeout=TIMEOUT, transport=transport) as client:
         # Only the cheapest model: a description doesn't need wit, it has the most free
@@ -238,7 +255,7 @@ def parse_about(data):
     about = str(json_reply(data).get("about") or "").strip().rstrip(".")
     if not about:
         raise TryNext(BROKEN)
-    return about[:200]
+    return about[:300]
 
 
 def own_answers(lines):
