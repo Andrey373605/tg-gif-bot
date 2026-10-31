@@ -68,16 +68,21 @@ DRAFT_TASK = f"""
    может быть короткая реакция, если она подходит по смыслу. Двух вариантов одного приёма не надо.
    Для question каждый вариант содержит настоящий ответ, для serious — без стёба,
    для bait варианты не нужны.
-   Факт из досье — максимум в одном варианте и только если он сам напрашивается.
+   Факт из досье — максимум в одном варианте, только один факт и только если он сам
+   напрашивается. Два факта в одной шутке — нельзя.
+3. В поле facts каждого варианта честно перечисли факты из досье, на которых он держится
+   (по 2–3 слова: «стройка», «кола по акции»), или оставь пустым. Варианты с двумя и больше
+   фактами бот выбросит.
 """
 
 JUDGE_PROMPT = """Ты — самый придирчивый участник телеграм-чата «адские дрочиллы иитп 2007»: одногруппники-айтишники из Минска, всем около двадцати, юмор сухой и матерный. Бот чата Гойдик придумал несколько вариантов ответа на сообщение. Выбери тот, после которого чат реально напишет «ахахах» или «база».
 
 Сначала проверь каждый вариант (поле verdicts): запиши его проблему или пустую строку, если проблем нет.
 - притянут факт: вариант шутит про работу, хобби или привычку человека, а в сообщении об этом ни слова и прямо из него это не следует. В тему, если сообщение про то же или факт прямо вытекает: «колу взял» → кола по акции, «реал выиграл» → барса, «нет времени» → работа, «наушники сдохли» → новые не купит. Притянуто: «сходил на концерт» → работа, «переезжаю» → тиктоки, «чел с попугаем в метро» → альтушки
+- винегрет: в одной шутке склеены два и больше факта из досье («на стройке колу по акции дают»)
 - повтор: та же тема, шутка или словечко, что в последних ответах Гойдика
 - длинно: больше двух предложений, объясняет шутку или нанизывает несколько подколов. Одно-два предложения с одной шуткой — нормально
-- мимо: на реальный вопрос нет ответа, на серьёзное — стёб, не про сообщение или не подходит по смыслу (на «ты еблан?» ответить «база» — согласиться, что еблан)
+- мимо: на реальный вопрос нет ответа, на серьёзное — стёб, не про сообщение или не подходит по смыслу (на «ты еблан?» ответить «база» — согласиться, что еблан), на переспрос «причём тут это?» — новая бессмыслица вместо ответа
 - шаблон: звучит как тамада, ассистент или натужная заготовка
 - нельзя: мамы, педофилия, народы, всерьёз политика
 
@@ -94,9 +99,15 @@ DRAFT_SCHEMA = {
             "type": "ARRAY",
             "items": {
                 "type": "OBJECT",
-                "properties": {"reaction": {"type": "STRING"}, "text": {"type": "STRING"}},
-                "required": ["reaction", "text"],
-                "propertyOrdering": ["reaction", "text"],
+                "properties": {
+                    "reaction": {"type": "STRING"},
+                    "text": {"type": "STRING"},
+                    # Listed so the bot can drop options that glue several facts together:
+                    # the light judge lets them through however it's told
+                    "facts": {"type": "ARRAY", "items": {"type": "STRING"}},
+                },
+                "required": ["reaction", "text", "facts"],
+                "propertyOrdering": ["reaction", "text", "facts"],
             },
         },
     },
@@ -245,7 +256,11 @@ def judge_text(message, lines, used, options):
     parts.append("Сообщение Гойдику:\n" + message)
     if used:
         parts.append("Последние ответы Гойдика:\n" + "\n".join(f"- {a}" for a in used))
-    parts.append("Варианты:\n" + "\n".join(f"{n}. [{o['reaction']}] {o['text']}" for n, o in enumerate(options, 1)))
+    rows = []
+    for n, o in enumerate(options, 1):
+        fact = f"; факт из досье: {o['facts'][0]}" if o["facts"] else ""
+        rows.append(f"{n}. [{o['reaction']}{fact}] {o['text']}")
+    parts.append("Варианты:\n" + "\n".join(rows))
     return "\n\n".join(parts)
 
 
@@ -302,10 +317,18 @@ def parse_draft(data):
     draft = json_reply(data)
     kind = draft.get("kind")
     options = [
-        {"reaction": str(o.get("reaction", "")), "text": o["text"].strip()}
+        {
+            "reaction": str(o.get("reaction", "")),
+            "text": o["text"].strip(),
+            "facts": [str(f) for f in o.get("facts") or [] if str(f).strip()],
+        }
         for o in draft.get("options") or []
         if isinstance(o, dict) and isinstance(o.get("text"), str) and o["text"].strip()
     ]
+    # Two dossier facts in one joke make a mess ("на стройке колу по акции дают")
+    single = [o for o in options if len(o["facts"]) < 2]
+    if single:
+        options = single
     if kind != "bait" and not options:
         log.warning("draft without options: %.200s", draft)
         raise TryNext(BROKEN)

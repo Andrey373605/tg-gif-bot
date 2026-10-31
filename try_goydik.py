@@ -81,7 +81,8 @@ async def answer(who, text, recent, indent):
     for n, option in enumerate(trace.get("options", []), 1):
         mark = "→" if n == trace.get("choice") else " "
         problem = f"   ✗ {problems[n]}" if problems.get(n) else ""
-        print(f"{indent}  {mark} {n}. [{option['reaction']}] {option['text']}{problem}")
+        facts = f" ({', '.join(option['facts'])})" if option.get("facts") else ""
+        print(f"{indent}  {mark} {n}. [{option['reaction']}]{facts} {option['text']}{problem}")
     print(f"{indent}Гойдик: {reply if reply is not None else '(промолчал)'}")
     return reply
 
