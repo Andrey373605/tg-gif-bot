@@ -353,8 +353,7 @@ async def talk(msg, text, context):
     typing = asyncio.create_task(keep_typing(context.bot, msg.chat_id))
     ok = False
     try:
-        # GIFs are collected in groups only, each group has its own
-        gifs = GIFS.choices(msg.chat_id) if in_group else None
+        gifs = fresh_gifs(msg.chat_id, [text] + recent) if in_group else None
         reply = await goydik.ask(history, author, text, recent=recent, gifs=gifs)
         ok = True
     except goydik.GoydikError as e:
@@ -378,6 +377,13 @@ async def talk(msg, text, context):
     if ok and in_group and sent:
         # The bot doesn't receive its own messages, so add the answer to the log by hand
         remember(context.chat_data, sent.message_id, "Гойдик", said)
+
+
+def fresh_gifs(chat_id, lines):
+    """The group's GIFs Гойдик may answer with (they're collected in groups only), minus the
+    ones in `lines`: a GIF sent to him would fit his answer best, and he'd just send it back."""
+    seen = "\n".join(lines)
+    return [g for g in GIFS.choices(chat_id) if f"[гифка: {g['about']}]" not in seen]
 
 
 async def send_gif(msg, reply):
